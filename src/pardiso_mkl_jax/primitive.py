@@ -245,6 +245,10 @@ def solve(indptr, indices, values, right_hand_side, *, matrix_type: MatrixType):
     """
     check_matrix_type_supported(matrix_type)
     check_csr_arrays(indptr, indices, values)
-    check_upper_triangular(indptr, indices, matrix_type)
+    # check_upper_triangular returns indices threaded through a runtime
+    # check (see its docstring): the returned value, not the original
+    # indices, must be what actually reaches the solve below, or the check
+    # is dead-code-eliminated whenever indptr/indices are traced.
+    indices = check_upper_triangular(indptr, indices, matrix_type)
     solve_core = _make_solve_core(MatrixType(matrix_type))
     return solve_core(indptr, indices, values, right_hand_side)

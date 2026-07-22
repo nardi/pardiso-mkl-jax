@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import enum
 
+import equinox as eqx
+import jax
+import jax.numpy as jnp
 import numpy as np
 
 
@@ -15,11 +18,18 @@ class MatrixType(enum.IntEnum):
     included so the full set of matrix types Pardiso itself supports is
     documented here, and raise NotImplementedError if selected.
 
-    Every symmetric member (everything except REAL_NONSYMMETRIC and
-    COMPLEX_NONSYMMETRIC) requires the CSR arrays to hold only the upper
+    The members whose values are mathematically symmetric or Hermitian
+    (REAL_SYMMETRIC_POSITIVE_DEFINITE, REAL_SYMMETRIC_INDEFINITE,
+    COMPLEX_HERMITIAN_POSITIVE_DEFINITE, COMPLEX_HERMITIAN_INDEFINITE, and
+    COMPLEX_SYMMETRIC) require the CSR arrays to hold only the upper
     triangle, including the diagonal, not the full matrix: passing the full
-    matrix corrupts Pardiso's factorization instead of raising a clear error.
-    check_upper_triangular enforces this.
+    matrix corrupts Pardiso's factorization instead of raising a clear
+    error. check_upper_triangular enforces this.
+
+    The structurally symmetric members (REAL_STRUCTURALLY_SYMMETRIC and
+    COMPLEX_STRUCTURALLY_SYMMETRIC) only assume a symmetric sparsity
+    pattern, not symmetric values, so they need the full matrix like the
+    nonsymmetric members do.
     """
 
     REAL_STRUCTURALLY_SYMMETRIC = 1
@@ -62,13 +72,14 @@ _SUPPORTED_MATRIX_TYPES = frozenset(
 )
 
 # Matrix types for which Pardiso expects only the upper triangle (including
-# the diagonal) to be stored, not the full matrix.
+# the diagonal) to be stored, not the full matrix. This is exactly the
+# matrix types whose values are mathematically symmetric or Hermitian, not
+# the structurally symmetric ones: those only assume a symmetric sparsity
+# pattern, and Pardiso still needs both triangles of values for them.
 _SYMMETRIC_MATRIX_TYPES = frozenset(
     (
-        MatrixType.REAL_STRUCTURALLY_SYMMETRIC,
         MatrixType.REAL_SYMMETRIC_POSITIVE_DEFINITE,
         MatrixType.REAL_SYMMETRIC_INDEFINITE,
-        MatrixType.COMPLEX_STRUCTURALLY_SYMMETRIC,
         MatrixType.COMPLEX_HERMITIAN_POSITIVE_DEFINITE,
         MatrixType.COMPLEX_HERMITIAN_INDEFINITE,
         MatrixType.COMPLEX_SYMMETRIC,
@@ -114,7 +125,15 @@ def check_csr_arrays(indptr, indices, values) -> None:
         )
 
 
-def check_upper_triangular(indptr, indices, matrix_type: MatrixType) -> None:
+def _upper_triangular_message(matrix_type: MatrixType) -> str:
+    return (
+        f"{matrix_type.name} requires the CSR arrays to store only the upper triangle "
+        "(column index >= row index for every entry), including the diagonal. Drop the "
+        "lower-triangle entries before calling in."
+    )
+
+
+def check_upper_triangular(indptr, indices, matrix_type: MatrixType):
     """For symmetric matrix types, validate that only the upper triangle is stored.
 
     Pardiso's symmetric matrix types expect the CSR arrays to hold only the
@@ -125,21 +144,33 @@ def check_upper_triangular(indptr, indices, matrix_type: MatrixType) -> None:
     from documentation. Non-symmetric matrix types are unaffected: the full
     matrix is exactly what they expect, so this check is skipped for them.
 
-    indptr and indices must be concrete arrays for this check to run, since
-    the sparsity pattern is treated as static structure throughout this
-    package rather than a traced value.
+    Returns indices unchanged. When indptr and indices are concrete (the
+    common eager case), a violation raises ValueError immediately. When
+    they are traced instead (under jit or vmap), the same check is built
+    into the traced program with equinox.error_if, so it still fires at
+    runtime rather than being silently skipped, though it then reports a
+    RuntimeError: JAX has no mechanism to raise a plain Python exception
+    from inside a traced program. Callers must use the returned value, not
+    the original indices, or the traced check is optimized away as dead
+    code.
     """
     if matrix_type not in _SYMMETRIC_MATRIX_TYPES:
-        return
-    indptr_values = np.asarray(indptr)
-    indices_values = np.asarray(indices)
+        return indices
+    try:
+        indptr_values = np.asarray(indptr)
+        indices_values = np.asarray(indices)
+    except jax.errors.TracerArrayConversionError:
+        row_of_entry = jnp.repeat(
+            jnp.arange(indptr.shape[0] - 1),
+            jnp.diff(indptr),
+            total_repeat_length=indices.shape[0],
+        )
+        violation = jnp.any(indices < row_of_entry)
+        return eqx.error_if(indices, violation, _upper_triangular_message(matrix_type))
     row_of_entry = np.repeat(np.arange(indptr_values.shape[0] - 1), np.diff(indptr_values))
     if np.any(indices_values < row_of_entry):
-        raise ValueError(
-            f"{matrix_type.name} requires the CSR arrays to store only the upper triangle "
-            "(column index >= row index for every entry), including the diagonal. Drop the "
-            "lower-triangle entries before calling in."
-        )
+        raise ValueError(_upper_triangular_message(matrix_type))
+    return indices
 
 
 def matrix_dimension(indptr) -> int:

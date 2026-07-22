@@ -27,6 +27,10 @@ dependencies = [
     "numpy>=1.26",
     "scipy>=1.11",
     "mkl>=2024",
+    # Used only for equinox.error_if, so the upper-triangular structure
+    # check in matrix.py can still raise at runtime when indptr and indices
+    # are traced under jit or vmap, instead of being silently skipped.
+    "equinox>=0.11",
 ]
 
 [project.urls]

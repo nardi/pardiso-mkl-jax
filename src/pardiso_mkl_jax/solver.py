@@ -45,9 +45,8 @@ class PardisoSolver:
         check_matrix_type_supported(matrix_type)
         if indptr.dtype.name != "int32" or indices.dtype.name != "int32":
             raise TypeError("indptr and indices must have dtype int32.")
-        check_upper_triangular(indptr, indices, matrix_type)
         self._indptr = indptr
-        self._indices = indices
+        self._indices = check_upper_triangular(indptr, indices, matrix_type)
         self._matrix_type = matrix_type
         self._dimension = matrix_dimension(indptr)
         self._solver_id = primitive.allocate_solver_id()
