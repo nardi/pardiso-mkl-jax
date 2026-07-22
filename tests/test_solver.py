@@ -8,14 +8,14 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-import pardiso_mkl_jax as pardiso
+import pardiso_mkl_jax as pmj
 from pardiso_mkl_jax import _ffi
 
 
-def test_solve_matches_dense_reference(nonsymmetric_system):
-    indptr, indices, values, dense, right_hand_side = nonsymmetric_system
-    with pardiso.PardisoSolver(
-        jnp.asarray(indptr), jnp.asarray(indices), matrix_type=pardiso.MatrixType.REAL_NONSYMMETRIC
+def test_solve_matches_dense_reference(system):
+    matrix_type, indptr, indices, values, dense, right_hand_side = system
+    with pmj.PardisoSolver(
+        jnp.asarray(indptr), jnp.asarray(indices), matrix_type=matrix_type
     ) as solver:
         solver.analyze(jnp.asarray(values))
         solver.factorize(jnp.asarray(values))
@@ -24,11 +24,11 @@ def test_solve_matches_dense_reference(nonsymmetric_system):
     np.testing.assert_allclose(np.asarray(solution), expected, rtol=1e-8, atol=1e-10)
 
 
-def test_solve_reused_across_many_right_hand_sides(nonsymmetric_system):
-    indptr, indices, values, dense, _right_hand_side = nonsymmetric_system
+def test_solve_reused_across_many_right_hand_sides(system):
+    matrix_type, indptr, indices, values, dense, _right_hand_side = system
     random_state = np.random.default_rng(42)
-    with pardiso.PardisoSolver(
-        jnp.asarray(indptr), jnp.asarray(indices), matrix_type=pardiso.MatrixType.REAL_NONSYMMETRIC
+    with pmj.PardisoSolver(
+        jnp.asarray(indptr), jnp.asarray(indices), matrix_type=matrix_type
     ) as solver:
         solver.analyze(jnp.asarray(values))
         solver.factorize(jnp.asarray(values))
@@ -39,10 +39,10 @@ def test_solve_reused_across_many_right_hand_sides(nonsymmetric_system):
             np.testing.assert_allclose(np.asarray(solution), expected, rtol=1e-8, atol=1e-10)
 
 
-def test_refactorize_updates_values_without_reanalyzing(nonsymmetric_system):
-    indptr, indices, values, dense, right_hand_side = nonsymmetric_system
-    with pardiso.PardisoSolver(
-        jnp.asarray(indptr), jnp.asarray(indices), matrix_type=pardiso.MatrixType.REAL_NONSYMMETRIC
+def test_refactorize_updates_values_without_reanalyzing(system):
+    matrix_type, indptr, indices, values, dense, right_hand_side = system
+    with pmj.PardisoSolver(
+        jnp.asarray(indptr), jnp.asarray(indices), matrix_type=matrix_type
     ) as solver:
         solver.analyze(jnp.asarray(values))
         assert _ffi.analysis_count(solver._solver_id) == 1
@@ -59,75 +59,79 @@ def test_refactorize_updates_values_without_reanalyzing(nonsymmetric_system):
         np.testing.assert_allclose(np.asarray(solution), expected, rtol=1e-8, atol=1e-10)
 
 
-def test_methods_require_context_manager(nonsymmetric_system):
-    indptr, indices, values, _dense, _right_hand_side = nonsymmetric_system
-    solver = pardiso.PardisoSolver(
-        jnp.asarray(indptr), jnp.asarray(indices), matrix_type=pardiso.MatrixType.REAL_NONSYMMETRIC
+def test_many_create_close_cycles_do_not_leak(system):
+    matrix_type, indptr, indices, values, dense, right_hand_side = system
+    expected = np.linalg.solve(dense, right_hand_side)
+    for _ in range(20):
+        with pmj.PardisoSolver(
+            jnp.asarray(indptr), jnp.asarray(indices), matrix_type=matrix_type
+        ) as solver:
+            solver.analyze(jnp.asarray(values))
+            solver.factorize(jnp.asarray(values))
+            solution = solver.solve(jnp.asarray(right_hand_side))
+        np.testing.assert_allclose(np.asarray(solution), expected, rtol=1e-8, atol=1e-10)
+
+
+# The lifecycle and precondition checks below (context manager enforcement,
+# method ordering, idempotent close) do not depend on the matrix type: they
+# are raised before Pardiso ever sees the values, so they run once against
+# a single representative system rather than once per matrix type.
+
+
+def test_methods_require_context_manager(any_system):
+    indptr, indices, values, _dense, _right_hand_side = any_system
+    solver = pmj.PardisoSolver(
+        jnp.asarray(indptr), jnp.asarray(indices), matrix_type=pmj.MatrixType.REAL_NONSYMMETRIC
     )
     with pytest.raises(RuntimeError, match="context manager"):
         solver.analyze(jnp.asarray(values))
 
 
-def test_methods_reject_use_after_close(nonsymmetric_system):
-    indptr, indices, values, _dense, _right_hand_side = nonsymmetric_system
-    with pardiso.PardisoSolver(
-        jnp.asarray(indptr), jnp.asarray(indices), matrix_type=pardiso.MatrixType.REAL_NONSYMMETRIC
+def test_methods_reject_use_after_close(any_system):
+    indptr, indices, values, _dense, _right_hand_side = any_system
+    with pmj.PardisoSolver(
+        jnp.asarray(indptr), jnp.asarray(indices), matrix_type=pmj.MatrixType.REAL_NONSYMMETRIC
     ) as solver:
         solver.analyze(jnp.asarray(values))
     with pytest.raises(RuntimeError, match="closed"):
         solver.factorize(jnp.asarray(values))
 
 
-def test_factorize_requires_prior_analyze(nonsymmetric_system):
-    indptr, indices, values, _dense, _right_hand_side = nonsymmetric_system
-    with pardiso.PardisoSolver(
-        jnp.asarray(indptr), jnp.asarray(indices), matrix_type=pardiso.MatrixType.REAL_NONSYMMETRIC
+def test_factorize_requires_prior_analyze(any_system):
+    indptr, indices, values, _dense, _right_hand_side = any_system
+    with pmj.PardisoSolver(
+        jnp.asarray(indptr), jnp.asarray(indices), matrix_type=pmj.MatrixType.REAL_NONSYMMETRIC
     ) as solver:
         with pytest.raises(RuntimeError, match="analyze"):
             solver.factorize(jnp.asarray(values))
 
 
-def test_refactorize_requires_prior_factorize(nonsymmetric_system):
-    indptr, indices, values, _dense, _right_hand_side = nonsymmetric_system
-    with pardiso.PardisoSolver(
-        jnp.asarray(indptr), jnp.asarray(indices), matrix_type=pardiso.MatrixType.REAL_NONSYMMETRIC
+def test_refactorize_requires_prior_factorize(any_system):
+    indptr, indices, values, _dense, _right_hand_side = any_system
+    with pmj.PardisoSolver(
+        jnp.asarray(indptr), jnp.asarray(indices), matrix_type=pmj.MatrixType.REAL_NONSYMMETRIC
     ) as solver:
         solver.analyze(jnp.asarray(values))
         with pytest.raises(RuntimeError, match="factorize"):
             solver.refactorize(jnp.asarray(values))
 
 
-def test_solve_requires_prior_factorize(nonsymmetric_system):
-    indptr, indices, values, _dense, right_hand_side = nonsymmetric_system
-    with pardiso.PardisoSolver(
-        jnp.asarray(indptr), jnp.asarray(indices), matrix_type=pardiso.MatrixType.REAL_NONSYMMETRIC
+def test_solve_requires_prior_factorize(any_system):
+    indptr, indices, values, _dense, right_hand_side = any_system
+    with pmj.PardisoSolver(
+        jnp.asarray(indptr), jnp.asarray(indices), matrix_type=pmj.MatrixType.REAL_NONSYMMETRIC
     ) as solver:
         solver.analyze(jnp.asarray(values))
         with pytest.raises(RuntimeError, match="factorize"):
             solver.solve(jnp.asarray(right_hand_side))
 
 
-def test_close_is_idempotent(nonsymmetric_system):
-    indptr, indices, values, _dense, _right_hand_side = nonsymmetric_system
-    with pardiso.PardisoSolver(
-        jnp.asarray(indptr), jnp.asarray(indices), matrix_type=pardiso.MatrixType.REAL_NONSYMMETRIC
+def test_close_is_idempotent(any_system):
+    indptr, indices, values, _dense, _right_hand_side = any_system
+    with pmj.PardisoSolver(
+        jnp.asarray(indptr), jnp.asarray(indices), matrix_type=pmj.MatrixType.REAL_NONSYMMETRIC
     ) as solver:
         solver.analyze(jnp.asarray(values))
     # __exit__ already closed it; closing again must not raise.
     solver.close()
     solver.close()
-
-
-def test_many_create_close_cycles_do_not_leak(nonsymmetric_system):
-    indptr, indices, values, dense, right_hand_side = nonsymmetric_system
-    expected = np.linalg.solve(dense, right_hand_side)
-    for _ in range(20):
-        with pardiso.PardisoSolver(
-            jnp.asarray(indptr),
-            jnp.asarray(indices),
-            matrix_type=pardiso.MatrixType.REAL_NONSYMMETRIC,
-        ) as solver:
-            solver.analyze(jnp.asarray(values))
-            solver.factorize(jnp.asarray(values))
-            solution = solver.solve(jnp.asarray(right_hand_side))
-        np.testing.assert_allclose(np.asarray(solution), expected, rtol=1e-8, atol=1e-10)

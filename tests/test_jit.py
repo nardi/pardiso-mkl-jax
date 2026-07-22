@@ -8,50 +8,50 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-import pardiso_mkl_jax as pardiso
+import pardiso_mkl_jax as pmj
 
 
-def test_jit_matches_eager(nonsymmetric_system):
-    indptr, indices, values, dense, right_hand_side = nonsymmetric_system
+def test_jit_matches_eager(system):
+    matrix_type, indptr, indices, values, dense, right_hand_side = system
 
     @functools.partial(jax.jit, static_argnames=("matrix_type",))
     def solve(indptr, indices, values, right_hand_side, matrix_type):
-        return pardiso.solve(indptr, indices, values, right_hand_side, matrix_type=matrix_type)
+        return pmj.solve(indptr, indices, values, right_hand_side, matrix_type=matrix_type)
 
     jit_solution = solve(
         jnp.asarray(indptr),
         jnp.asarray(indices),
         jnp.asarray(values),
         jnp.asarray(right_hand_side),
-        pardiso.MatrixType.REAL_NONSYMMETRIC,
+        matrix_type,
     )
-    eager_solution = pardiso.solve(
+    eager_solution = pmj.solve(
         jnp.asarray(indptr),
         jnp.asarray(indices),
         jnp.asarray(values),
         jnp.asarray(right_hand_side),
-        matrix_type=pardiso.MatrixType.REAL_NONSYMMETRIC,
+        matrix_type=matrix_type,
     )
     np.testing.assert_allclose(np.asarray(jit_solution), np.asarray(eager_solution), rtol=1e-10)
     expected = np.linalg.solve(dense, right_hand_side)
     np.testing.assert_allclose(np.asarray(jit_solution), expected, rtol=1e-8, atol=1e-10)
 
 
-def test_jit_reuses_compiled_executable_across_calls(nonsymmetric_system):
+def test_jit_reuses_compiled_executable_across_calls(system):
     """A jitted solve gives correct results across repeated calls with different right-hand sides.
 
     Uses different right-hand sides so it also confirms the compiled
     executable is reused rather than retracing on every call.
     """
-    indptr, indices, values, dense, right_hand_side = nonsymmetric_system
+    matrix_type, indptr, indices, values, dense, right_hand_side = system
 
     solve = jax.jit(
-        lambda right_hand_side: pardiso.solve(
+        lambda right_hand_side: pmj.solve(
             jnp.asarray(indptr),
             jnp.asarray(indices),
             jnp.asarray(values),
             right_hand_side,
-            matrix_type=pardiso.MatrixType.REAL_NONSYMMETRIC,
+            matrix_type=matrix_type,
         )
     )
 
