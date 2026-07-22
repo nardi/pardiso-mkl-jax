@@ -8,15 +8,15 @@ import jax
 jax.config.update("jax_enable_x64", True)
 
 import jax.numpy as jnp
-import pardiso_mkl_jax as pardiso
+import pardiso_mkl_jax as pmj
 
 indptr = jnp.array([0, 2, 3, 4], dtype=jnp.int32)
 indices = jnp.array([0, 1, 1, 2], dtype=jnp.int32)
 values = jnp.array([4.0, 1.0, 3.0, 2.0], dtype=jnp.float64)
 right_hand_side = jnp.array([1.0, 2.0, 3.0], dtype=jnp.float64)
 
-x = pardiso.solve(
-    indptr, indices, values, right_hand_side, matrix_type=pardiso.MatrixType.REAL_NONSYMMETRIC
+x = pmj.solve(
+    indptr, indices, values, right_hand_side, matrix_type=pmj.MatrixType.REAL_NONSYMMETRIC
 )
 ```
 
