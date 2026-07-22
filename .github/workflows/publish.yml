@@ -3,19 +3,33 @@ on:
   release:
     types: [published]
 jobs:
-  build:
+  build_wheels:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      # Builds inside a manylinux container and repairs the result with
+      # auditwheel, per [tool.cibuildwheel] in pyproject.toml, so the
+      # uploaded wheel is installable on any compatible Linux system rather
+      # than only on this runner's own glibc.
+      - uses: pypa/cibuildwheel@v4.1.0
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels
+          path: wheelhouse/*.whl
+
+  build_sdist:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
       - uses: astral-sh/setup-uv@v7
-      - run: uv build
+      - run: uv build --sdist
       - uses: actions/upload-artifact@v4
         with:
-          name: dist
-          path: dist/
+          name: sdist
+          path: dist/*.tar.gz
 
   publish:
-    needs: build
+    needs: [build_wheels, build_sdist]
     runs-on: ubuntu-latest
     environment: pypi
     permissions:
@@ -26,6 +40,7 @@ jobs:
     steps:
       - uses: actions/download-artifact@v4
         with:
-          name: dist
+          pattern: "*"
           path: dist/
+          merge-multiple: true
       - uses: pypa/gh-action-pypi-publish@release/v1

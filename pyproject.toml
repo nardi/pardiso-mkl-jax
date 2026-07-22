@@ -65,6 +65,22 @@ docs = [
 # See the comment in the dev dependency group above for why.
 no-build-isolation-package = ["pardiso-mkl-jax"]
 
+[tool.cibuildwheel]
+# The mkl PyPI wheels are only published for Linux and Windows, and
+# meson.build links libmkl_rt with GNU ld's "-l:filename" syntax, which only
+# a Linux/GNU toolchain understands, so only manylinux x86_64 wheels are
+# built for now. Windows support would need a separate link strategy.
+build = "{cp311-manylinux_x86_64,cp312-manylinux_x86_64,cp313-manylinux_x86_64}"
+test-requires = "pytest"
+test-command = "pytest {project}/tests"
+
+[tool.cibuildwheel.linux]
+# libmkl_rt is loaded explicitly at runtime from the separately installed
+# mkl runtime package (see _mkl_loader.py), not linked into the wheel, so
+# auditwheel must be told to leave it out rather than vendor a copy of it
+# into the wheel.
+repair-wheel-command = "auditwheel repair --exclude libmkl_rt.so.3 -w {dest_dir} {wheel}"
+
 [tool.ruff]
 line-length = 100
 target-version = "py311"
