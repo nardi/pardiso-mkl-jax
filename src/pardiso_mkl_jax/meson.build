@@ -41,8 +41,20 @@ if host_system == 'windows'
   # below.
   cpp_compiler = meson.get_compiler('cpp')
   mkl_rt_dependency = cpp_compiler.find_library('mkl_rt', dirs: [mkl_lib_dir])
+
+  extra_link_args = []
+  if cpp_compiler.get_id() == 'gcc'
+    # A MinGW-w64 toolchain (as opposed to MSVC) otherwise links the
+    # extension against libgcc/libstdc++/libwinpthread DLLs that ship with
+    # the toolchain itself rather than with Windows or Python, so importing
+    # the extension fails on any machine that doesn't happen to have that
+    # toolchain's bin directory on PATH.
+    extra_link_args = ['-static-libgcc', '-static-libstdc++', '-static-libwinpthread']
+  endif
+
   mkl_dependency = declare_dependency(
     compile_args: ['-I' + mkl_include_dir],
+    link_args: extra_link_args,
     dependencies: [mkl_rt_dependency],
   )
 else

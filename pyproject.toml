@@ -65,6 +65,15 @@ docs = [
 # See the comment in the dev dependency group above for why.
 no-build-isolation-package = ["pardiso-mkl-jax"]
 
+[tool.meson-python.args]
+# --vsenv is a no-op on non-Windows (meson checks is_windows() before doing
+# anything). On Windows it locates and activates the Visual Studio
+# environment via vswhere/vcvars, even when a gcc/clang is already on PATH
+# (e.g. from MSYS2 or Git Bash), so the extension always links against MSVC
+# rather than against MinGW's own libgcc/libstdc++/libwinpthread runtime
+# DLLs, which aren't guaranteed to be present on the end user's machine.
+setup = ["--vsenv"]
+
 [tool.cibuildwheel]
 # The mkl PyPI wheels are only published for Linux and Windows (x86_64), so
 # only those platforms are built.
