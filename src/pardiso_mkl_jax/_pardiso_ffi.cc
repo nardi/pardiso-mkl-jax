@@ -162,16 +162,26 @@ ffi::Error PardisoFactorImpl(int64_t solver_id, int64_t phase, int64_t matrix_ty
 }
 
 // Solve (phase 33) against a factorization already produced for solver_id.
+// transpose_mode is iparm[11] directly: 0 solves Ax = b, 2 solves A^T x = b
+// (conjugate transpose, value 1, coincides with plain transpose for the
+// real-valued matrices this package supports). Reuses the same
+// factorization either way: an LU (or LDL^T) factorization of A supports
+// solving with A^T through forward/back substitution in the opposite
+// order, with no need to refactorize.
 ffi::Error PardisoSolveImpl(int64_t solver_id, int64_t matrix_type, int64_t dimension,
-                             int64_t number_of_right_hand_sides, ffi::Buffer<ffi::S32> indptr,
-                             ffi::Buffer<ffi::S32> indices, ffi::Buffer<ffi::F64> values,
-                             ffi::Buffer<ffi::F64> right_hand_side,
+                             int64_t number_of_right_hand_sides, int64_t transpose_mode,
+                             ffi::Buffer<ffi::S32> indptr, ffi::Buffer<ffi::S32> indices,
+                             ffi::Buffer<ffi::F64> values, ffi::Buffer<ffi::F64> right_hand_side,
                              ffi::ResultBuffer<ffi::F64> solution) {
   std::lock_guard<std::mutex> lock(RegistryMutex());
   PardisoState& state = GetOrCreateState(solver_id);
   state.matrix_type = static_cast<MKL_INT>(matrix_type);
   state.dimension = static_cast<MKL_INT>(dimension);
   InitializeIparm(state.iparm, state.matrix_type);
+  // Set unconditionally (not only when transposed) so a later solve on the
+  // same solver_id without transpose is not left with a stale value from an
+  // earlier call.
+  state.iparm[11] = static_cast<MKL_INT>(transpose_mode);
 
   MKL_INT maxfct = 1;
   MKL_INT mnum = 1;
@@ -226,7 +236,7 @@ ffi::Error PardisoReleaseImpl(int64_t solver_id, ffi::ResultBuffer<ffi::S32> sta
 // returning. Used by the functional solve() entry point, which never reuses
 // a factorization and so never needs a registry entry.
 ffi::Error PardisoSolveOnceImpl(int64_t matrix_type, int64_t dimension,
-                                 int64_t number_of_right_hand_sides,
+                                 int64_t number_of_right_hand_sides, int64_t transpose_mode,
                                  ffi::Buffer<ffi::S32> indptr, ffi::Buffer<ffi::S32> indices,
                                  ffi::Buffer<ffi::F64> values,
                                  ffi::Buffer<ffi::F64> right_hand_side,
@@ -235,6 +245,7 @@ ffi::Error PardisoSolveOnceImpl(int64_t matrix_type, int64_t dimension,
   MKL_INT iparm[64] = {};
   MKL_INT mtype_value = static_cast<MKL_INT>(matrix_type);
   InitializeIparm(iparm, mtype_value);
+  iparm[11] = static_cast<MKL_INT>(transpose_mode);
 
   MKL_INT maxfct = 1;
   MKL_INT mnum = 1;
@@ -280,6 +291,7 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(kPardisoSolveHandler, PardisoSolveImpl,
                                    .Attr<int64_t>("matrix_type")
                                    .Attr<int64_t>("dimension")
                                    .Attr<int64_t>("number_of_right_hand_sides")
+                                   .Attr<int64_t>("transpose_mode")
                                    .Arg<ffi::Buffer<ffi::S32>>()  // indptr
                                    .Arg<ffi::Buffer<ffi::S32>>()  // indices
                                    .Arg<ffi::Buffer<ffi::F64>>()  // values
@@ -298,6 +310,7 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(kPardisoSolveOnceHandler, PardisoSolveOnceImpl,
                                    .Attr<int64_t>("matrix_type")
                                    .Attr<int64_t>("dimension")
                                    .Attr<int64_t>("number_of_right_hand_sides")
+                                   .Attr<int64_t>("transpose_mode")
                                    .Arg<ffi::Buffer<ffi::S32>>()  // indptr
                                    .Arg<ffi::Buffer<ffi::S32>>()  // indices
                                    .Arg<ffi::Buffer<ffi::F64>>()  // values

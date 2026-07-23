@@ -48,6 +48,46 @@ with pmj.PardisoSolver(
     third = solver.solve(jnp.array([1.0, 2.0, 3.0], dtype=jnp.float64))
 ```
 
+## Solving the transpose
+
+Both [`solve`][pardiso_mkl_jax.solve] and
+[`PardisoSolver.solve`][pardiso_mkl_jax.PardisoSolver.solve] accept a
+`transpose` argument. Setting it solves `A^T x = right_hand_side` instead of
+`A x = right_hand_side`, reusing exactly the same factorization: an LU (or
+LDL^T) factorization of `A` supports triangular solves in either direction,
+so no separate factorization of `A^T` is needed, and no explicit transpose of
+the CSR arrays either.
+
+```python
+import jax
+
+jax.config.update("jax_enable_x64", True)
+
+import jax.numpy as jnp
+import pardiso_mkl_jax as pmj
+
+indptr = jnp.array([0, 2, 3, 4], dtype=jnp.int32)
+indices = jnp.array([0, 1, 1, 2], dtype=jnp.int32)
+values = jnp.array([4.0, 1.0, 3.0, 2.0], dtype=jnp.float64)
+
+with pmj.PardisoSolver(
+    indptr, indices, matrix_type=pmj.MatrixType.REAL_NONSYMMETRIC
+) as solver:
+    solver.analyze(values)
+    solver.factorize(values)
+
+    right_hand_side = jnp.array([1.0, 2.0, 3.0], dtype=jnp.float64)
+    x = solver.solve(right_hand_side)
+    x_transpose = solver.solve(right_hand_side, transpose=True)
+```
+
+Alternating `transpose` between calls on the same `PardisoSolver` is safe:
+each `solve()` call sets it fresh, so it never leaks into a later call that
+does not ask for it. For matrix types whose values are mathematically
+symmetric or Hermitian (`REAL_SYMMETRIC_POSITIVE_DEFINITE`,
+`REAL_SYMMETRIC_INDEFINITE`), `A^T` equals `A`, so `transpose=True` gives the
+same result as `transpose=False`.
+
 ## Batching with vmap
 
 `solve` carries a custom batching rule, so `jax.vmap` reuses what Pardiso

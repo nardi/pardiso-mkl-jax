@@ -25,6 +25,36 @@ def test_solve_matches_dense_reference(system):
     np.testing.assert_allclose(np.asarray(solution), expected, rtol=1e-8, atol=1e-10)
 
 
+def test_solve_transpose_matches_dense_reference(system):
+    matrix_type, indptr, indices, values, dense, right_hand_side = system
+    solution = pmj.solve(
+        jnp.asarray(indptr),
+        jnp.asarray(indices),
+        jnp.asarray(values),
+        jnp.asarray(right_hand_side),
+        matrix_type=matrix_type,
+        transpose=True,
+    )
+    expected = np.linalg.solve(dense.T, right_hand_side)
+    np.testing.assert_allclose(np.asarray(solution), expected, rtol=1e-8, atol=1e-10)
+
+
+def test_solve_transpose_matches_eager_under_jit(system):
+    matrix_type, indptr, indices, values, dense, right_hand_side = system
+
+    jit_solve = jax.jit(pmj.solve, static_argnames=("matrix_type", "transpose"))
+    solution = jit_solve(
+        jnp.asarray(indptr),
+        jnp.asarray(indices),
+        jnp.asarray(values),
+        jnp.asarray(right_hand_side),
+        matrix_type=matrix_type,
+        transpose=True,
+    )
+    expected = np.linalg.solve(dense.T, right_hand_side)
+    np.testing.assert_allclose(np.asarray(solution), expected, rtol=1e-8, atol=1e-10)
+
+
 def test_solve_rejects_wrong_index_dtype(system):
     matrix_type, indptr, indices, values, _dense, right_hand_side = system
     with pytest.raises(TypeError, match="int32"):

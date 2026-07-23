@@ -39,6 +39,37 @@ def test_solve_reused_across_many_right_hand_sides(system):
             np.testing.assert_allclose(np.asarray(solution), expected, rtol=1e-8, atol=1e-10)
 
 
+def test_solve_transpose_reuses_factorization(system):
+    matrix_type, indptr, indices, values, dense, right_hand_side = system
+    with pmj.PardisoSolver(
+        jnp.asarray(indptr), jnp.asarray(indices), matrix_type=matrix_type
+    ) as solver:
+        solver.analyze(jnp.asarray(values))
+        solver.factorize(jnp.asarray(values))
+        assert _ffi.analysis_count(solver._solver_id) == 1
+
+        # Alternating transpose and non-transpose solves on the same
+        # factorization must each give the right answer, with no
+        # re-analysis and no state left over from the previous call.
+        non_transpose = solver.solve(jnp.asarray(right_hand_side))
+        transpose = solver.solve(jnp.asarray(right_hand_side), transpose=True)
+        non_transpose_again = solver.solve(jnp.asarray(right_hand_side))
+        assert _ffi.analysis_count(solver._solver_id) == 1
+
+    np.testing.assert_allclose(
+        np.asarray(non_transpose), np.linalg.solve(dense, right_hand_side), rtol=1e-8, atol=1e-10
+    )
+    np.testing.assert_allclose(
+        np.asarray(transpose), np.linalg.solve(dense.T, right_hand_side), rtol=1e-8, atol=1e-10
+    )
+    np.testing.assert_allclose(
+        np.asarray(non_transpose_again),
+        np.linalg.solve(dense, right_hand_side),
+        rtol=1e-8,
+        atol=1e-10,
+    )
+
+
 def test_refactorize_updates_values_without_reanalyzing(system):
     matrix_type, indptr, indices, values, dense, right_hand_side = system
     with pmj.PardisoSolver(

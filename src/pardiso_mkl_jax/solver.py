@@ -130,8 +130,14 @@ class PardisoSolver:
         )
         self._values = values
 
-    def solve(self, right_hand_side):
-        """Solve against the current factorization. Requires a prior factorize()."""
+    def solve(self, right_hand_side, *, transpose: bool = False):
+        """Solve against the current factorization. Requires a prior factorize().
+
+        Solves against A^T instead of A when transpose is set, reusing the
+        same factorization: no extra factorize() call is needed to switch
+        between the two, and consecutive calls with different transpose
+        values are safe.
+        """
         self._check_usable()
         if not self._factorized:
             raise RuntimeError("solve() requires factorize() to have been called first.")
@@ -143,5 +149,6 @@ class PardisoSolver:
             stacked_right_hand_side,
             solver_id=self._solver_id,
             matrix_type=self._matrix_type,
+            transpose=transpose,
         )
         return solution[0]
