@@ -16,3 +16,17 @@ jobs:
       - run: uv run ruff check .
       - run: uv run ruff format --check .
       - run: uv run ty check
+
+  build_wheels:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      # Builds the same wheels as the publish workflow and runs the test
+      # suite against each one (per [tool.cibuildwheel] in pyproject.toml),
+      # so a wheel that fails to build or fails its tests is caught on every
+      # PR and push to main rather than only when cutting a release.
+      - uses: pypa/cibuildwheel@v4.1.0
