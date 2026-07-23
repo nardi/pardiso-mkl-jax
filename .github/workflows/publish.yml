@@ -27,6 +27,12 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: astral-sh/setup-uv@v7
+      # `uv build` needs meson-python, Cython, and mkl-devel importable, since
+      # [tool.uv].no-build-isolation-package disables build isolation for
+      # this package and reuses the active environment instead, so sync the
+      # dev group into .venv first rather than relying on an isolated build
+      # env that's never created.
+      - run: uv sync --group dev
       - run: uv build --sdist
       - uses: actions/upload-artifact@v4
         with:
