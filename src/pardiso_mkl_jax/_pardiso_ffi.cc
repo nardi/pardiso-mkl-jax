@@ -34,6 +34,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <cstring>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -118,6 +119,19 @@ std::string PardisoErrorMessage(const char* stage, MKL_INT error) {
   return std::string("pardiso ") + stage + " failed with error code " + std::to_string(error);
 }
 
+// Applies a caller-supplied override on top of the defaults InitializeIparm
+// already set: overlay_mask[i] != 0 means overlay_values[i] replaces
+// iparm[i]. All validation and any user-facing warnings happen entirely on
+// the Python side (canonicalize_overlay in iparm.py) before this ever runs,
+// so this is purely mechanical.
+void ApplyOverlay(MKL_INT* iparm, const int32_t* overlay_mask, const int32_t* overlay_values) {
+  for (int i = 0; i < 64; ++i) {
+    if (overlay_mask[i] != 0) {
+      iparm[i] = static_cast<MKL_INT>(overlay_values[i]);
+    }
+  }
+}
+
 }  // namespace
 
 extern "C" long pardiso_analysis_count(long handle) {
@@ -143,8 +157,11 @@ namespace {
 // data dependency instead of by a static, trace-time-baked id.
 ffi::Error PardisoAnalyzeImpl(int64_t matrix_type, int64_t dimension,
                                ffi::Buffer<ffi::S32> indptr, ffi::Buffer<ffi::S32> indices,
-                               ffi::Buffer<ffi::F64> values, ffi::ResultBuffer<ffi::S64> handle_out,
-                               ffi::ResultBuffer<ffi::S32> status) {
+                               ffi::Buffer<ffi::F64> values, ffi::Buffer<ffi::S32> options_mask,
+                               ffi::Buffer<ffi::S32> options_values,
+                               ffi::ResultBuffer<ffi::S64> handle_out,
+                               ffi::ResultBuffer<ffi::S32> status,
+                               ffi::ResultBuffer<ffi::S32> final_iparm) {
   int64_t handle = HandleCounter().fetch_add(1);
 
   std::lock_guard<std::mutex> lock(RegistryMutex());
@@ -152,6 +169,7 @@ ffi::Error PardisoAnalyzeImpl(int64_t matrix_type, int64_t dimension,
   state.matrix_type = static_cast<MKL_INT>(matrix_type);
   state.dimension = static_cast<MKL_INT>(dimension);
   InitializeIparm(state.iparm, state.matrix_type);
+  ApplyOverlay(state.iparm, options_mask.typed_data(), options_values.typed_data());
 
   MKL_INT maxfct = 1;
   MKL_INT mnum = 1;
@@ -167,6 +185,7 @@ ffi::Error PardisoAnalyzeImpl(int64_t matrix_type, int64_t dimension,
 
   state.analysis_count += 1;
   handle_out->typed_data()[0] = handle;
+  std::memcpy(final_iparm->typed_data(), state.iparm, sizeof(MKL_INT) * 64);
   status->typed_data()[0] = static_cast<int32_t>(error);
   if (error != 0) {
     return ffi::Error::Internal(PardisoErrorMessage("analyze", error));
@@ -181,8 +200,11 @@ ffi::Error PardisoAnalyzeImpl(int64_t matrix_type, int64_t dimension,
 ffi::Error PardisoFactorImpl(int64_t matrix_type, int64_t dimension,
                               ffi::Buffer<ffi::S64> handle_in, ffi::Buffer<ffi::S32> indptr,
                               ffi::Buffer<ffi::S32> indices, ffi::Buffer<ffi::F64> values,
+                              ffi::Buffer<ffi::S32> options_mask,
+                              ffi::Buffer<ffi::S32> options_values,
                               ffi::ResultBuffer<ffi::S64> handle_out,
-                              ffi::ResultBuffer<ffi::S32> status) {
+                              ffi::ResultBuffer<ffi::S32> status,
+                              ffi::ResultBuffer<ffi::S32> final_iparm) {
   int64_t handle = handle_in.typed_data()[0];
 
   std::lock_guard<std::mutex> lock(RegistryMutex());
@@ -190,6 +212,7 @@ ffi::Error PardisoFactorImpl(int64_t matrix_type, int64_t dimension,
   state.matrix_type = static_cast<MKL_INT>(matrix_type);
   state.dimension = static_cast<MKL_INT>(dimension);
   InitializeIparm(state.iparm, state.matrix_type);
+  ApplyOverlay(state.iparm, options_mask.typed_data(), options_values.typed_data());
 
   MKL_INT maxfct = 1;
   MKL_INT mnum = 1;
@@ -204,6 +227,7 @@ ffi::Error PardisoFactorImpl(int64_t matrix_type, int64_t dimension,
           state.iparm, &message_level, /*b=*/nullptr, /*x=*/nullptr, &error);
 
   handle_out->typed_data()[0] = handle;
+  std::memcpy(final_iparm->typed_data(), state.iparm, sizeof(MKL_INT) * 64);
   status->typed_data()[0] = static_cast<int32_t>(error);
   if (error != 0) {
     return ffi::Error::Internal(PardisoErrorMessage("factor", error));
@@ -223,7 +247,10 @@ ffi::Error PardisoSolveImpl(int64_t matrix_type, int64_t dimension,
                              ffi::Buffer<ffi::S64> handle_in, ffi::Buffer<ffi::S32> indptr,
                              ffi::Buffer<ffi::S32> indices, ffi::Buffer<ffi::F64> values,
                              ffi::Buffer<ffi::F64> right_hand_side,
-                             ffi::ResultBuffer<ffi::F64> solution) {
+                             ffi::Buffer<ffi::S32> options_mask,
+                             ffi::Buffer<ffi::S32> options_values,
+                             ffi::ResultBuffer<ffi::F64> solution,
+                             ffi::ResultBuffer<ffi::S32> final_iparm) {
   int64_t handle = handle_in.typed_data()[0];
 
   std::lock_guard<std::mutex> lock(RegistryMutex());
@@ -231,9 +258,13 @@ ffi::Error PardisoSolveImpl(int64_t matrix_type, int64_t dimension,
   state.matrix_type = static_cast<MKL_INT>(matrix_type);
   state.dimension = static_cast<MKL_INT>(dimension);
   InitializeIparm(state.iparm, state.matrix_type);
+  ApplyOverlay(state.iparm, options_mask.typed_data(), options_values.typed_data());
   // Set unconditionally (not only when transposed) so a later solve on the
   // same handle without transpose is not left with a stale value from an
-  // earlier call.
+  // earlier call. Applied after ApplyOverlay: canonicalize_overlay in
+  // iparm.py guarantees a caller-supplied overlay never touches index 11
+  // (transpose_mode is the sole owner of it), so there is no real conflict
+  // to resolve here.
   state.iparm[11] = static_cast<MKL_INT>(transpose_mode);
 
   MKL_INT maxfct = 1;
@@ -248,6 +279,7 @@ ffi::Error PardisoSolveImpl(int64_t matrix_type, int64_t dimension,
           AsMklInt(indices.typed_data()), /*perm=*/nullptr, &nrhs, state.iparm, &message_level,
           const_cast<double*>(right_hand_side.typed_data()), solution->typed_data(), &error);
 
+  std::memcpy(final_iparm->typed_data(), state.iparm, sizeof(MKL_INT) * 64);
   if (error != 0) {
     return ffi::Error::Internal(PardisoErrorMessage("solve", error));
   }
@@ -265,7 +297,10 @@ ffi::Error PardisoFactorSolveImpl(int64_t matrix_type, int64_t dimension,
                                    ffi::Buffer<ffi::S64> handle_in, ffi::Buffer<ffi::S32> indptr,
                                    ffi::Buffer<ffi::S32> indices, ffi::Buffer<ffi::F64> values,
                                    ffi::Buffer<ffi::F64> right_hand_side,
-                                   ffi::ResultBuffer<ffi::F64> solution) {
+                                   ffi::Buffer<ffi::S32> options_mask,
+                                   ffi::Buffer<ffi::S32> options_values,
+                                   ffi::ResultBuffer<ffi::F64> solution,
+                                   ffi::ResultBuffer<ffi::S32> final_iparm) {
   int64_t handle = handle_in.typed_data()[0];
 
   std::lock_guard<std::mutex> lock(RegistryMutex());
@@ -273,8 +308,10 @@ ffi::Error PardisoFactorSolveImpl(int64_t matrix_type, int64_t dimension,
   state.matrix_type = static_cast<MKL_INT>(matrix_type);
   state.dimension = static_cast<MKL_INT>(dimension);
   InitializeIparm(state.iparm, state.matrix_type);
+  ApplyOverlay(state.iparm, options_mask.typed_data(), options_values.typed_data());
   // Set unconditionally, matching PardisoSolveImpl, so a later call without
-  // transpose is not left with a stale value from an earlier one.
+  // transpose is not left with a stale value from an earlier one. Applied
+  // after ApplyOverlay for the same reason given there.
   state.iparm[11] = static_cast<MKL_INT>(transpose_mode);
 
   MKL_INT maxfct = 1;
@@ -289,6 +326,7 @@ ffi::Error PardisoFactorSolveImpl(int64_t matrix_type, int64_t dimension,
           AsMklInt(indices.typed_data()), /*perm=*/nullptr, &nrhs, state.iparm, &message_level,
           const_cast<double*>(right_hand_side.typed_data()), solution->typed_data(), &error);
 
+  std::memcpy(final_iparm->typed_data(), state.iparm, sizeof(MKL_INT) * 64);
   if (error != 0) {
     return ffi::Error::Internal(PardisoErrorMessage("factor_and_solve", error));
   }
@@ -336,11 +374,15 @@ ffi::Error PardisoSolveOnceImpl(int64_t matrix_type, int64_t dimension,
                                  ffi::Buffer<ffi::S32> indptr, ffi::Buffer<ffi::S32> indices,
                                  ffi::Buffer<ffi::F64> values,
                                  ffi::Buffer<ffi::F64> right_hand_side,
-                                 ffi::ResultBuffer<ffi::F64> solution) {
+                                 ffi::Buffer<ffi::S32> options_mask,
+                                 ffi::Buffer<ffi::S32> options_values,
+                                 ffi::ResultBuffer<ffi::F64> solution,
+                                 ffi::ResultBuffer<ffi::S32> final_iparm) {
   void* handle[64] = {};
   MKL_INT iparm[64] = {};
   MKL_INT mtype_value = static_cast<MKL_INT>(matrix_type);
   InitializeIparm(iparm, mtype_value);
+  ApplyOverlay(iparm, options_mask.typed_data(), options_values.typed_data());
   iparm[11] = static_cast<MKL_INT>(transpose_mode);
 
   MKL_INT maxfct = 1;
@@ -355,6 +397,11 @@ ffi::Error PardisoSolveOnceImpl(int64_t matrix_type, int64_t dimension,
           const_cast<double*>(values.typed_data()), AsMklInt(indptr.typed_data()),
           AsMklInt(indices.typed_data()), /*perm=*/nullptr, &nrhs, iparm, &message_level,
           const_cast<double*>(right_hand_side.typed_data()), solution->typed_data(), &error);
+
+  // Captured right after the solving call and before the release call
+  // below, which reuses the same iparm array and could otherwise overwrite
+  // these diagnostics with whatever the release phase leaves behind.
+  std::memcpy(final_iparm->typed_data(), iparm, sizeof(MKL_INT) * 64);
 
   // Always release the local handle, even on failure, so a failed solve
   // never leaks native memory.
@@ -376,8 +423,11 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(kPardisoAnalyzeHandler, PardisoAnalyzeImpl,
                                    .Arg<ffi::Buffer<ffi::S32>>()  // indptr
                                    .Arg<ffi::Buffer<ffi::S32>>()  // indices
                                    .Arg<ffi::Buffer<ffi::F64>>()  // values
+                                   .Arg<ffi::Buffer<ffi::S32>>()  // options_mask
+                                   .Arg<ffi::Buffer<ffi::S32>>()  // options_values
                                    .Ret<ffi::Buffer<ffi::S64>>()  // handle
                                    .Ret<ffi::Buffer<ffi::S32>>()  // status
+                                   .Ret<ffi::Buffer<ffi::S32>>()  // final_iparm
 );
 
 XLA_FFI_DEFINE_HANDLER_SYMBOL(kPardisoFactorHandler, PardisoFactorImpl,
@@ -388,8 +438,11 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(kPardisoFactorHandler, PardisoFactorImpl,
                                    .Arg<ffi::Buffer<ffi::S32>>()  // indptr
                                    .Arg<ffi::Buffer<ffi::S32>>()  // indices
                                    .Arg<ffi::Buffer<ffi::F64>>()  // values
+                                   .Arg<ffi::Buffer<ffi::S32>>()  // options_mask
+                                   .Arg<ffi::Buffer<ffi::S32>>()  // options_values
                                    .Ret<ffi::Buffer<ffi::S64>>()  // handle
                                    .Ret<ffi::Buffer<ffi::S32>>()  // status
+                                   .Ret<ffi::Buffer<ffi::S32>>()  // final_iparm
 );
 
 XLA_FFI_DEFINE_HANDLER_SYMBOL(kPardisoSolveHandler, PardisoSolveImpl,
@@ -403,7 +456,10 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(kPardisoSolveHandler, PardisoSolveImpl,
                                    .Arg<ffi::Buffer<ffi::S32>>()  // indices
                                    .Arg<ffi::Buffer<ffi::F64>>()  // values
                                    .Arg<ffi::Buffer<ffi::F64>>()  // right_hand_side
+                                   .Arg<ffi::Buffer<ffi::S32>>()  // options_mask
+                                   .Arg<ffi::Buffer<ffi::S32>>()  // options_values
                                    .Ret<ffi::Buffer<ffi::F64>>()  // solution
+                                   .Ret<ffi::Buffer<ffi::S32>>()  // final_iparm
 );
 
 XLA_FFI_DEFINE_HANDLER_SYMBOL(kPardisoFactorSolveHandler, PardisoFactorSolveImpl,
@@ -417,7 +473,10 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(kPardisoFactorSolveHandler, PardisoFactorSolveImpl
                                    .Arg<ffi::Buffer<ffi::S32>>()  // indices
                                    .Arg<ffi::Buffer<ffi::F64>>()  // values
                                    .Arg<ffi::Buffer<ffi::F64>>()  // right_hand_side
+                                   .Arg<ffi::Buffer<ffi::S32>>()  // options_mask
+                                   .Arg<ffi::Buffer<ffi::S32>>()  // options_values
                                    .Ret<ffi::Buffer<ffi::F64>>()  // solution
+                                   .Ret<ffi::Buffer<ffi::S32>>()  // final_iparm
 );
 
 XLA_FFI_DEFINE_HANDLER_SYMBOL(kPardisoReleaseHandler, PardisoReleaseImpl,
@@ -436,7 +495,10 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(kPardisoSolveOnceHandler, PardisoSolveOnceImpl,
                                    .Arg<ffi::Buffer<ffi::S32>>()  // indices
                                    .Arg<ffi::Buffer<ffi::F64>>()  // values
                                    .Arg<ffi::Buffer<ffi::F64>>()  // right_hand_side
+                                   .Arg<ffi::Buffer<ffi::S32>>()  // options_mask
+                                   .Arg<ffi::Buffer<ffi::S32>>()  // options_values
                                    .Ret<ffi::Buffer<ffi::F64>>()  // solution
+                                   .Ret<ffi::Buffer<ffi::S32>>()  // final_iparm
 );
 
 }  // namespace
