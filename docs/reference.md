@@ -12,6 +12,14 @@
 
 ::: pardiso_mkl_jax.MatrixType
 
+## `PardisoOption`
+
+::: pardiso_mkl_jax.PardisoOption
+
+## `PardisoDiagnostics`
+
+::: pardiso_mkl_jax.PardisoDiagnostics
+
 ## `primitive`
 
 The low-level building blocks `PardisoSolver` is built from, for callers who

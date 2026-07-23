@@ -125,12 +125,18 @@ values = jnp.array([4.0, 1.0, 3.0, 2.0], dtype=jnp.float64)
 right_hand_side = jnp.array([1.0, 2.0, 3.0], dtype=jnp.float64)
 matrix_type = pmj.MatrixType.REAL_NONSYMMETRIC
 
-handle = primitive.analyze(indptr, indices, values, matrix_type=matrix_type)
-solution = primitive.factor_and_solve_stateful(
+handle, _final_iparm = primitive.analyze(indptr, indices, values, matrix_type=matrix_type)
+solution, final_iparm = primitive.factor_and_solve_stateful(
     handle, indptr, indices, values, right_hand_side[None, :], matrix_type=matrix_type
 )
 primitive.release(handle)
 ```
+
+Every primitive returns the raw `iparm` array Pardiso left behind alongside
+its usual result, and takes an `options` overlay; see
+[Overriding solver settings](#overriding-solver-settings) below. Decode the
+raw array with
+[`PardisoDiagnostics.from_iparm`][pardiso_mkl_jax.PardisoDiagnostics].
 
 As with `PardisoSolver`, releasing a handle while something else might still
 use it is a bug: since `release` and any other consumer of `handle` share no
@@ -226,11 +232,11 @@ for.
 
 ## Solver settings
 
-Pardiso is controlled through a 64-entry `iparm` array. pardiso_mkl_jax does
-not expose this array to callers in this version: it fills it with a fixed
-set of defaults, chosen for correctness and predictable performance across
-the matrix types this package supports. This section documents and
-motivates each of them.
+Pardiso is controlled through a 64-entry `iparm` array. pardiso_mkl_jax fills
+it with a fixed set of defaults, chosen for correctness and predictable
+performance across the matrix types this package supports. This section
+documents and motivates each of them. Every one of them can be overridden,
+see "Overriding solver settings" below.
 
 `iparm[0]` is set to 1, meaning every other entry below is used exactly as
 given rather than left for Pardiso to fill in on its own. This is forced
@@ -271,3 +277,172 @@ that just restate what Pardiso's own default would have been.
   arrays throughout, matching NumPy, SciPy, and JAX, so leaving Pardiso's
   default here would mean re-indexing every array before every call,
   breaking the zero-copy interface this package promises.
+
+## Overriding solver settings
+
+[`solve`][pardiso_mkl_jax.solve], and every [`PardisoSolver`][pardiso_mkl_jax.PardisoSolver]
+method (`analyze`, `factorize`, `refactorize`, `solve`,
+`refactor_and_solve`), accept an `options` argument: a `{option: value}` overlay applied on top of the defaults
+documented above. Keys are members of
+[`PardisoOption`][pardiso_mkl_jax.PardisoOption], or the raw `iparm` index as
+a plain int, for anything not given a named member.
+
+```python
+import jax
+
+jax.config.update("jax_enable_x64", True)
+
+import jax.numpy as jnp
+import pardiso_mkl_jax as pmj
+from pardiso_mkl_jax import PardisoOption
+
+indptr = jnp.array([0, 2, 3, 4], dtype=jnp.int32)
+indices = jnp.array([0, 1, 1, 2], dtype=jnp.int32)
+values = jnp.array([4.0, 1.0, 3.0, 2.0], dtype=jnp.float64)
+right_hand_side = jnp.array([1.0, 2.0, 3.0], dtype=jnp.float64)
+
+# Minimum degree ordering instead of the default METIS nested dissection.
+x = pmj.solve(
+    indptr,
+    indices,
+    values,
+    right_hand_side,
+    matrix_type=pmj.MatrixType.REAL_NONSYMMETRIC,
+    options={PardisoOption.FILL_IN_REDUCING_ORDERING: 0},
+)
+
+with pmj.PardisoSolver(
+    indptr, indices, matrix_type=pmj.MatrixType.REAL_NONSYMMETRIC
+) as solver:
+    solver.analyze(values, options={PardisoOption.FILL_IN_REDUCING_ORDERING: 0})
+    solver.factorize(values)
+    x = solver.solve(right_hand_side)
+```
+
+An overlay entry does not persist beyond the call it was passed to.
+`PardisoSolver`'s defaults are recomputed fresh on every `analyze`,
+`factorize`, or `refactorize` call, so an overlay entry passed to `analyze`
+does not automatically apply to a later `factorize` or `refactorize` on the
+same solver: pass it again wherever it needs to apply.
+
+Most `iparm` entries can be overridden freely. A few are handled specially:
+
+- `USE_DEFAULT_VALUES` (`iparm[0]`) and `WEIGHTED_MATCHING` (`iparm[12]`) can
+  be set to anything, with no runtime warning. Setting `USE_DEFAULT_VALUES`
+  away from 1 is exactly what the crash workaround above depends on staying
+  at 1, and `WEIGHTED_MATCHING` is the specific setting that workaround keeps
+  disabled, so touching either one is knowingly reaching for that risk.
+- `INDEXING_STYLE` (`iparm[34]`) can be set, but raises a `UserWarning`:
+  every CSR array this package builds is zero-based, so anything else risks
+  Pardiso silently misreading `indptr` and `indices`.
+- `USER_PERMUTATION`, `PARTIAL_SOLVE_CONTROL`, and `SCHUR_COMPLEMENT_CONTROL`
+  cannot be enabled (a `ValueError` rejects any non-zero value): each needs a
+  native argument this package always passes as null, so enabling one would
+  read or write through a null pointer.
+- `TRANSPOSE_SOLVE` cannot be set through `options` at all: use the
+  `transpose` argument instead (see "Solving the transpose" above), which
+  already covers everything this index can express for the real-valued
+  matrices this package supports.
+
+Keep the overlay stable across many calls in performance-sensitive code.
+Internally, `solve` builds one compiled batching rule per distinct
+`(matrix_type, transpose, options)` combination and keeps it cached for the
+life of the process, the same way it already does for `matrix_type` and
+`transpose` alone. A fixed overlay is free after the first call; an overlay
+that changes on every call (for example, sweeping a setting in a parameter
+search) grows that cache by one compiled rule per distinct value, with no
+upper bound.
+
+## Diagnostics
+
+Pardiso writes several outputs back into `iparm` after a call: memory used,
+iterative refinement steps actually run, perturbed pivot count, eigenvalue
+counts for symmetric indefinite matrices, and more. `solve` and every
+`PardisoSolver` method surface these through
+[`PardisoDiagnostics`][pardiso_mkl_jax.PardisoDiagnostics].
+
+Pass `return_diagnostics=True` to `solve` to get `(solution, diagnostics)`
+back instead of just the solution. `PardisoSolver` records diagnostics from
+`analyze`, `factorize`, `refactorize`, and `solve` automatically, readable
+from `last_diagnostics`:
+
+```python
+import jax
+
+jax.config.update("jax_enable_x64", True)
+
+import jax.numpy as jnp
+import pardiso_mkl_jax as pmj
+
+# An indefinite matrix, so it has both positive and negative eigenvalues.
+indptr = jnp.array([0, 2, 3], dtype=jnp.int32)
+indices = jnp.array([0, 1, 1], dtype=jnp.int32)
+values = jnp.array([1.0, 1.0, -1.0], dtype=jnp.float64)
+
+with pmj.PardisoSolver(
+    indptr, indices, matrix_type=pmj.MatrixType.REAL_SYMMETRIC_INDEFINITE
+) as solver:
+    solver.analyze(values)
+    solver.factorize(values)
+    diagnostics = solver.last_diagnostics
+
+assert diagnostics is not None
+positive_eigenvalues = diagnostics.positive_eigenvalues
+negative_eigenvalues = diagnostics.negative_eigenvalues
+```
+
+Fields not given a name are still reachable through `diagnostics.raw`, the
+full 64-entry `iparm` array Pardiso left behind.
+
+`refactor_and_solve` is the one method that does not update
+`last_diagnostics`. It is meant to be callable from inside a jitted function,
+where storing anything derived from its results would leave a tracer on the
+solver, so it takes the same `return_diagnostics=True` flag as `solve` and
+returns `(solution, diagnostics)` instead.
+
+Diagnostics work under `jit`, including when `solve` itself is wrapped
+directly, and under `vmap`. Under the default `vmap` batching (batching over
+`values`, or over both `values` and the right-hand side), each batch element
+gets its own diagnostics, since each one was genuinely factorized separately.
+Batching only over the right-hand side reuses a single native call for the
+whole batch, so Pardiso only reports diagnostics once: the output array still
+gains a batch dimension, matching `jax.vmap`'s usual behavior, but every
+entry along it is that same value, broadcast rather than recomputed. Pass
+`out_axes` on your own `jax.vmap` call if the compact, un-broadcast form is
+what you want instead:
+
+```python
+import jax
+
+jax.config.update("jax_enable_x64", True)
+
+import jax.numpy as jnp
+import pardiso_mkl_jax as pmj
+
+indptr = jnp.array([0, 2, 3, 4], dtype=jnp.int32)
+indices = jnp.array([0, 1, 1, 2], dtype=jnp.int32)
+values = jnp.array([4.0, 1.0, 3.0, 2.0], dtype=jnp.float64)
+
+
+def solve_with_fixed_matrix(right_hand_side):
+    return pmj.solve(
+        indptr,
+        indices,
+        values,
+        right_hand_side,
+        matrix_type=pmj.MatrixType.REAL_NONSYMMETRIC,
+        return_diagnostics=True,
+    )
+
+
+right_hand_sides = jnp.array(
+    [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0], [7.0, 8.0, 9.0]], dtype=jnp.float64
+)
+solutions, diagnostics = jax.vmap(solve_with_fixed_matrix, out_axes=(0, None))(
+    right_hand_sides
+)
+```
+
+Diagnostics are only ever available on success. A failed Pardiso call raises
+a Python exception instead of returning anything, diagnostics included: a
+function that raises cannot also return a value.
