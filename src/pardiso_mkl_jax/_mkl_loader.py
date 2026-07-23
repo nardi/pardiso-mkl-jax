@@ -31,6 +31,12 @@ def load_libmkl_rt() -> ctypes.CDLL:
                 "is the 'mkl' package installed in this environment?"
             )
         os.add_dll_directory(str(library_directory))
+        # add_dll_directory only affects extension-module loading and ctypes
+        # calls. oneMKL picks its threading-layer backend (e.g.
+        # mkl_intel_thread.*.dll) with its own internal LoadLibrary call at
+        # runtime, which uses the classic search order and so only finds
+        # sibling MKL DLLs if their directory is actually on PATH.
+        os.environ["PATH"] = str(library_directory) + os.pathsep + os.environ.get("PATH", "")
         return ctypes.CDLL(str(candidates[0]))
 
     library_directory = pathlib.Path(sys.prefix) / "lib"
