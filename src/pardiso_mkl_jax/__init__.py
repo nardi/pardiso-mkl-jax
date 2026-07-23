@@ -13,8 +13,9 @@ for reusing a factorization across many solves. See the user guide for both.
 # a plain sequence of imports inside a single module.
 from pardiso_mkl_jax import _mkl_loader  # noqa: F401, I001
 
+from pardiso_mkl_jax.iparm import PardisoDiagnostics, PardisoOption
 from pardiso_mkl_jax.matrix import MatrixType
 from pardiso_mkl_jax.primitive import solve
 from pardiso_mkl_jax.solver import PardisoSolver
 
-__all__ = ["MatrixType", "PardisoSolver", "solve"]
+__all__ = ["MatrixType", "PardisoDiagnostics", "PardisoOption", "PardisoSolver", "solve"]
