@@ -4,17 +4,22 @@ on:
     types: [published]
 jobs:
   build_wheels:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
-      # Builds inside a manylinux container and repairs the result with
-      # auditwheel, per [tool.cibuildwheel] in pyproject.toml, so the
-      # uploaded wheel is installable on any compatible Linux system rather
-      # than only on this runner's own glibc.
+      # On Linux this builds inside a manylinux container and repairs the
+      # result with auditwheel; on Windows it repairs with delvewheel
+      # instead. Both per [tool.cibuildwheel] in pyproject.toml, so the
+      # uploaded wheels are installable on any compatible system rather than
+      # only on the runner's own toolchain.
       - uses: pypa/cibuildwheel@v4.1.0
       - uses: actions/upload-artifact@v4
         with:
-          name: wheels
+          name: wheels-${{ matrix.os }}
           path: wheelhouse/*.whl
 
   build_sdist:

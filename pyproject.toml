@@ -66,11 +66,9 @@ docs = [
 no-build-isolation-package = ["pardiso-mkl-jax"]
 
 [tool.cibuildwheel]
-# The mkl PyPI wheels are only published for Linux and Windows, and
-# meson.build links libmkl_rt with GNU ld's "-l:filename" syntax, which only
-# a Linux/GNU toolchain understands, so only manylinux x86_64 wheels are
-# built for now. Windows support would need a separate link strategy.
-build = "{cp311-manylinux_x86_64,cp312-manylinux_x86_64,cp313-manylinux_x86_64}"
+# The mkl PyPI wheels are only published for Linux and Windows (x86_64), so
+# only those platforms are built.
+build = "{cp311-manylinux_x86_64,cp312-manylinux_x86_64,cp313-manylinux_x86_64,cp311-win_amd64,cp312-win_amd64,cp313-win_amd64}"
 test-requires = "pytest"
 test-command = "pytest {project}/tests"
 
@@ -80,6 +78,12 @@ test-command = "pytest {project}/tests"
 # auditwheel must be told to leave it out rather than vendor a copy of it
 # into the wheel.
 repair-wheel-command = "auditwheel repair --exclude libmkl_rt.so.3 -w {dest_dir} {wheel}"
+
+[tool.cibuildwheel.windows]
+# Same idea as the Linux repair command above, but delvewheel is the
+# Windows equivalent of auditwheel, and mkl_rt's DLL is versioned
+# (mkl_rt.<major>.dll) rather than named exactly like the import library.
+repair-wheel-command = "delvewheel repair --exclude mkl_rt.*.dll -w {dest_dir} -v {wheel}"
 
 [tool.ruff]
 line-length = 100
