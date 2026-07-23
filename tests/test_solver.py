@@ -175,11 +175,11 @@ def test_whole_lifecycle_inside_jit_reuses_analysis(system):
     indices = jnp.asarray(indices)
 
     def run(values, other_values, right_hand_side):
-        handle = primitive.analyze(indptr, indices, values, matrix_type=matrix_type)
-        first = primitive.factor_and_solve_stateful(
+        handle, _iparm = primitive.analyze(indptr, indices, values, matrix_type=matrix_type)
+        first, _iparm = primitive.factor_and_solve_stateful(
             handle, indptr, indices, values, right_hand_side[None, :], matrix_type=matrix_type
         )
-        second = primitive.factor_and_solve_stateful(
+        second, _iparm = primitive.factor_and_solve_stateful(
             handle,
             indptr,
             indices,
@@ -215,8 +215,8 @@ def test_whole_lifecycle_inside_jit_does_not_leak_handles(system):
     right_hand_side = jnp.asarray(right_hand_side)
 
     def run(values, right_hand_side):
-        handle = primitive.analyze(indptr, indices, values, matrix_type=matrix_type)
-        solution = primitive.factor_and_solve_stateful(
+        handle, _iparm = primitive.analyze(indptr, indices, values, matrix_type=matrix_type)
+        solution, _iparm = primitive.factor_and_solve_stateful(
             handle, indptr, indices, values, right_hand_side[None, :], matrix_type=matrix_type
         )
         # Forces release() to run after the solve above, for the same reason
