@@ -108,6 +108,7 @@ python.install_sources(
     '__init__.py',
     '_mkl_loader.py',
     '_ffi.pyi',
+    'iparm.py',
     'matrix.py',
     'primitive.py',
     'solver.py',
