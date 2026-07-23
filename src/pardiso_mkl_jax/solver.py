@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pardiso_mkl_jax import primitive
+from pardiso_mkl_jax.iparm import OptionsLike, PardisoDiagnostics
 from pardiso_mkl_jax.matrix import (
     MatrixType,
     check_csr_arrays,
@@ -34,6 +35,19 @@ class PardisoSolver:
       to call from inside a jitted function where the values and right-hand
       side are tracers.
 
+    Each of these accepts its own options overlay (see
+    pardiso_mkl_jax.iparm.PardisoOption), since Pardiso's defaults are
+    recomputed fresh on every call rather than persisted: an overlay entry
+    passed to analyze() does not carry over to a later factorize() or
+    refactorize() call, even on the same solver. Pass it again wherever it
+    needs to apply.
+
+    Each call also records its diagnostics (see PardisoDiagnostics),
+    readable afterward from last_diagnostics. The exception is
+    refactor_and_solve(), which returns them on request rather than storing
+    them, so that it keeps nothing on the solver and stays usable under jit;
+    see its docstring.
+
     PardisoSolver must be used as a context manager. Its native memory is
     released in __exit__, not in a destructor: Python does not guarantee when
     or whether __del__ runs, so relying on it could leave the native
@@ -62,6 +76,7 @@ class PardisoSolver:
         self._closed = False
         self._analyzed = False
         self._factorized = False
+        self._last_diagnostics: PardisoDiagnostics | None = None
 
     def __enter__(self) -> PardisoSolver:
         self._entered = True
@@ -77,6 +92,17 @@ class PardisoSolver:
                 primitive.release(self._handle)
             self._closed = True
 
+    @property
+    def last_diagnostics(self) -> PardisoDiagnostics | None:
+        """Diagnostics from the most recent analyze, factorize, refactorize, or solve call.
+
+        None before any call has been made. Only ever reflects a successful
+        call: a Pardiso error raises instead of returning, so a failed call
+        leaves this at whatever it was before that call. refactor_and_solve()
+        never updates this; it returns its diagnostics instead.
+        """
+        return self._last_diagnostics
+
     def _check_usable(self) -> None:
         if not self._entered:
             raise RuntimeError(
@@ -86,7 +112,7 @@ class PardisoSolver:
         if self._closed:
             raise RuntimeError("PardisoSolver is closed and can no longer be used.")
 
-    def analyze(self, values) -> None:
+    def analyze(self, values, *, options: OptionsLike = None) -> None:
         """Run the symbolic analysis (fill-reducing ordering) for the stored pattern.
 
         Takes a representative values array because Pardiso's default
@@ -97,23 +123,25 @@ class PardisoSolver:
         """
         self._check_usable()
         check_csr_arrays(self._indptr, self._indices, values)
-        self._handle = primitive.analyze(
+        self._handle, final_iparm = primitive.analyze(
             self._indptr,
             self._indices,
             values,
             matrix_type=self._matrix_type,
+            options=options,
         )
+        self._last_diagnostics = PardisoDiagnostics.from_iparm(final_iparm)
         self._analyzed = True
 
-    def factorize(self, values) -> None:
+    def factorize(self, values, *, options: OptionsLike = None) -> None:
         """Run the first numeric factorization for values. Requires a prior analyze()."""
         self._check_usable()
         if not self._analyzed:
             raise RuntimeError("factorize() requires analyze() to have been called first.")
-        self._run_numeric_factorization(values)
+        self._run_numeric_factorization(values, options=options)
         self._factorized = True
 
-    def refactorize(self, values) -> None:
+    def refactorize(self, values, *, options: OptionsLike = None) -> None:
         """Update the numeric factorization with new values on the same pattern.
 
         Requires a prior factorize(). Skips the analysis phase, which is the
@@ -122,20 +150,22 @@ class PardisoSolver:
         self._check_usable()
         if not self._factorized:
             raise RuntimeError("refactorize() requires factorize() to have been called first.")
-        self._run_numeric_factorization(values)
+        self._run_numeric_factorization(values, options=options)
 
-    def _run_numeric_factorization(self, values) -> None:
+    def _run_numeric_factorization(self, values, *, options: OptionsLike) -> None:
         check_csr_arrays(self._indptr, self._indices, values)
-        self._handle = primitive.factor(
+        self._handle, final_iparm = primitive.factor(
             self._handle,
             self._indptr,
             self._indices,
             values,
             matrix_type=self._matrix_type,
+            options=options,
         )
+        self._last_diagnostics = PardisoDiagnostics.from_iparm(final_iparm)
         self._values = values
 
-    def solve(self, right_hand_side, *, transpose: bool = False):
+    def solve(self, right_hand_side, *, transpose: bool = False, options: OptionsLike = None):
         """Solve against the current factorization. Requires a prior factorize().
 
         Solves against A^T instead of A when transpose is set, reusing the
@@ -147,7 +177,7 @@ class PardisoSolver:
         if not self._factorized:
             raise RuntimeError("solve() requires factorize() to have been called first.")
         stacked_right_hand_side = right_hand_side[None, :]
-        solution = primitive.solve_stateful(
+        solution, final_iparm = primitive.solve_stateful(
             self._handle,
             self._indptr,
             self._indices,
@@ -155,10 +185,20 @@ class PardisoSolver:
             stacked_right_hand_side,
             matrix_type=self._matrix_type,
             transpose=transpose,
+            options=options,
         )
+        self._last_diagnostics = PardisoDiagnostics.from_iparm(final_iparm)
         return solution[0]
 
-    def refactor_and_solve(self, values, right_hand_side, *, transpose: bool = False):
+    def refactor_and_solve(
+        self,
+        values,
+        right_hand_side,
+        *,
+        transpose: bool = False,
+        options: OptionsLike = None,
+        return_diagnostics: bool = False,
+    ):
         """Factorize for values and solve in one call, reusing the analysis.
 
         Requires a prior analyze(). Runs the numeric factorization and the
@@ -169,13 +209,19 @@ class PardisoSolver:
         on the solver, so values and right_hand_side may be tracers.
 
         Solves against A^T instead of A when transpose is set.
+
+        This is the one method that does not record its diagnostics on
+        last_diagnostics: storing them would put a tracer on the solver
+        whenever this runs under jit, which is exactly the state this method
+        avoids keeping. Pass return_diagnostics to get them back as a second
+        return value instead, which stays correct under jit.
         """
         self._check_usable()
         if not self._analyzed:
             raise RuntimeError("refactor_and_solve() requires analyze() to have been called first.")
         check_csr_arrays(self._indptr, self._indices, values)
         stacked_right_hand_side = right_hand_side[None, :]
-        solution = primitive.factor_and_solve_stateful(
+        solution, final_iparm = primitive.factor_and_solve_stateful(
             self._handle,
             self._indptr,
             self._indices,
@@ -183,5 +229,8 @@ class PardisoSolver:
             stacked_right_hand_side,
             matrix_type=self._matrix_type,
             transpose=transpose,
+            options=options,
         )
+        if return_diagnostics:
+            return solution[0], PardisoDiagnostics.from_iparm(final_iparm)
         return solution[0]
