@@ -16,6 +16,13 @@ into separate calls, so you control exactly what work happens on each one:
   matrix values change but its sparsity pattern does not.
 - `solve(right_hand_side)` solves against whatever factorization is
   currently stored, and can be called many times.
+- `refactor_and_solve(values, right_hand_side)` factorizes for new values and
+  solves in one call, reusing the analysis, and requires only a prior
+  `analyze()`. Unlike `refactorize()` followed by `solve()`, it keeps no
+  reference to `values` on the solver, so both `values` and `right_hand_side`
+  may be tracers. This is what makes `PardisoSolver` usable from inside a
+  jitted function, see [Composing inside jax.jit](#composing-inside-jaxjit)
+  below.
 
 `PardisoSolver` must be used as a context manager: its native memory is
 released in `__exit__`, not in a destructor, since Python does not guarantee
@@ -47,6 +54,89 @@ with pmj.PardisoSolver(
     solver.refactorize(values * 2.0)
     third = solver.solve(jnp.array([1.0, 2.0, 3.0], dtype=jnp.float64))
 ```
+
+## Composing inside jax.jit
+
+A `PardisoSolver`'s factorization is identified by a handle, an ordinary
+`int64` JAX array value threaded through `analyze`, `factor`, `solve`, and
+`release` under the hood. Once a solver has
+been analyzed, `refactor_and_solve` and `solve` can be called any number of
+times entirely inside a jitted function, with the analysis reused across
+calls:
+
+```python
+import jax
+
+jax.config.update("jax_enable_x64", True)
+
+import jax.numpy as jnp
+import pardiso_mkl_jax as pmj
+
+indptr = jnp.array([0, 2, 3, 4], dtype=jnp.int32)
+indices = jnp.array([0, 1, 1, 2], dtype=jnp.int32)
+values = jnp.array([4.0, 1.0, 3.0, 2.0], dtype=jnp.float64)
+
+with pmj.PardisoSolver(
+    indptr, indices, matrix_type=pmj.MatrixType.REAL_NONSYMMETRIC
+) as solver:
+    solver.analyze(values)
+
+    @jax.jit
+    def solve_two(values, other_values, right_hand_side):
+        first = solver.refactor_and_solve(values, right_hand_side)
+        second = solver.refactor_and_solve(other_values, right_hand_side)
+        return first, second
+
+    right_hand_side = jnp.array([1.0, 2.0, 3.0], dtype=jnp.float64)
+    first, second = solve_two(values, values * 2.0, right_hand_side)
+```
+
+To use `analyze` itself inside JIT, you need to use the lower-level API (see
+next section). This is necessary because the memory associated with the handle
+must be freed, and XLA can arbitrarily reorder operations if there is no
+dependency between them. Because the handle is data, XLA orders the whole
+lifecycle by data dependency, the same way it orders any other computation,
+which requires manual handle management and creating an explicit dependency on
+the results, for example with `jax.lax.optimization_barrier`..
+
+## Building on the low-level primitives
+
+`PardisoSolver` itself is built on the functions in
+[`pardiso_mkl_jax.primitive`][pardiso_mkl_jax.primitive]: `analyze`,
+`factor`, `solve_stateful`, `factor_and_solve_stateful`, and `release`. Each
+one threads a handle value in and, except for `solve_stateful`, back out
+again. Library authors who want to manage a factorization's lifetime
+explicitly, rather than through `PardisoSolver`'s own context manager, for
+example tying it to a scope object or to another jit-traced dependency, can
+call these functions directly:
+
+```python
+import jax
+
+jax.config.update("jax_enable_x64", True)
+
+import jax.numpy as jnp
+import pardiso_mkl_jax as pmj
+from pardiso_mkl_jax import primitive
+
+indptr = jnp.array([0, 2, 3, 4], dtype=jnp.int32)
+indices = jnp.array([0, 1, 1, 2], dtype=jnp.int32)
+values = jnp.array([4.0, 1.0, 3.0, 2.0], dtype=jnp.float64)
+right_hand_side = jnp.array([1.0, 2.0, 3.0], dtype=jnp.float64)
+matrix_type = pmj.MatrixType.REAL_NONSYMMETRIC
+
+handle = primitive.analyze(indptr, indices, values, matrix_type=matrix_type)
+solution = primitive.factor_and_solve_stateful(
+    handle, indptr, indices, values, right_hand_side[None, :], matrix_type=matrix_type
+)
+primitive.release(handle)
+```
+
+As with `PardisoSolver`, releasing a handle while something else might still
+use it is a bug: since `release` and any other consumer of `handle` share no
+ordering beyond their common input, a caller that wants a release ordered
+after a particular use should force that dependency explicitly, for example
+with `jax.lax.optimization_barrier`.
 
 ## Solving the transpose
 

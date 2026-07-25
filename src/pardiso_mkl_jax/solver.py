@@ -54,7 +54,9 @@ class PardisoSolver:
         self._indices = check_upper_triangular(indptr, indices, matrix_type)
         self._matrix_type = matrix_type
         self._dimension = matrix_dimension(indptr)
-        self._solver_id = primitive.allocate_solver_id()
+        # The handle is only obtained from analyze(), which allocates it on
+        # the native side, so there is nothing to hold until then.
+        self._handle = None
         self._values = None
         self._entered = False
         self._closed = False
@@ -71,7 +73,8 @@ class PardisoSolver:
     def close(self) -> None:
         """Release the native factorization. Called automatically by __exit__."""
         if not self._closed:
-            primitive.release(solver_id=self._solver_id)
+            if self._handle is not None:
+                primitive.release(self._handle)
             self._closed = True
 
     def _check_usable(self) -> None:
@@ -94,12 +97,10 @@ class PardisoSolver:
         """
         self._check_usable()
         check_csr_arrays(self._indptr, self._indices, values)
-        primitive.factor(
+        self._handle = primitive.analyze(
             self._indptr,
             self._indices,
             values,
-            solver_id=self._solver_id,
-            phase=primitive.PHASE_ANALYZE,
             matrix_type=self._matrix_type,
         )
         self._analyzed = True
@@ -125,12 +126,11 @@ class PardisoSolver:
 
     def _run_numeric_factorization(self, values) -> None:
         check_csr_arrays(self._indptr, self._indices, values)
-        primitive.factor(
+        self._handle = primitive.factor(
+            self._handle,
             self._indptr,
             self._indices,
             values,
-            solver_id=self._solver_id,
-            phase=primitive.PHASE_FACTORIZE,
             matrix_type=self._matrix_type,
         )
         self._values = values
@@ -148,11 +148,11 @@ class PardisoSolver:
             raise RuntimeError("solve() requires factorize() to have been called first.")
         stacked_right_hand_side = right_hand_side[None, :]
         solution = primitive.solve_stateful(
+            self._handle,
             self._indptr,
             self._indices,
             self._values,
             stacked_right_hand_side,
-            solver_id=self._solver_id,
             matrix_type=self._matrix_type,
             transpose=transpose,
         )
@@ -176,11 +176,11 @@ class PardisoSolver:
         check_csr_arrays(self._indptr, self._indices, values)
         stacked_right_hand_side = right_hand_side[None, :]
         solution = primitive.factor_and_solve_stateful(
+            self._handle,
             self._indptr,
             self._indices,
             values,
             stacked_right_hand_side,
-            solver_id=self._solver_id,
             matrix_type=self._matrix_type,
             transpose=transpose,
         )

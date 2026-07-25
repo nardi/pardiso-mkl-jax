@@ -8,23 +8,26 @@
 
 extern "C" {
 
-// Stateful handler for the analyze (phase 11) and numeric factorization
-// (phase 22) steps. Reads and updates the state kept in the process-global
-// registry, keyed by the solver_id attribute.
+// Stateful handler for the analyze step (phase 11). Allocates a fresh
+// registry entry and returns its key as an int64 handle value, which every
+// later stage threads through as ordinary data.
+void* pardiso_analyze_handler_address();
+
+// Stateful handler for the numeric factorization step (phase 22). Takes the
+// handle returned by analyze and passes it through unchanged, so a
+// downstream solve that consumes this handler's output is ordered after it.
 void* pardiso_factor_handler_address();
 
 // Stateful handler for the solve step (phase 33), run against a
-// factorization already produced by the factor handler for the same
-// solver_id.
+// factorization already produced by the factor (or analyze) handler for the
+// same handle.
 void* pardiso_solve_handler_address();
 
 // Stateful handler for the fused numeric factorization and solve (phase 23),
-// reusing the analysis already produced for the same solver_id. Fusing the two
-// steps keeps them ordered under jit, where separate factor and solve calls
-// are not.
+// reusing the analysis already produced for the same handle.
 void* pardiso_factor_solve_handler_address();
 
-// Releases the native memory associated with a solver_id and removes it from
+// Releases the native memory associated with a handle and removes it from
 // the registry.
 void* pardiso_release_handler_address();
 
@@ -33,10 +36,10 @@ void* pardiso_release_handler_address();
 // before the call returns, so it never touches the registry.
 void* pardiso_solve_once_handler_address();
 
-// Read and reset the analysis call counter for a solver_id. Used by tests to
+// Read and reset the analysis call counter for a handle. Used by tests to
 // assert that a reused factorization does not re-run the symbolic phase.
-long pardiso_analysis_count(long solver_id);
-void pardiso_reset_analysis_count(long solver_id);
+long pardiso_analysis_count(long handle);
+void pardiso_reset_analysis_count(long handle);
 
 }  // extern "C"
 
