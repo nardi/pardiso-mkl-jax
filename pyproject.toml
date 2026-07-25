@@ -16,12 +16,12 @@ requires = [
 
 [project]
 name = "pardiso-mkl-jax"
-version = "0.1.1"
+version = "0.1.2"
 description = "JAX-compatible interface to the oneMKL Pardiso direct sparse solver"
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.11"
-authors = [{ name = "nardi" }]
+authors = [{ name = "Nardi Lam", email = "mail@nardilam.nl" }]
 dependencies = [
     "jax>=0.10",
     "numpy>=1.26",
@@ -56,10 +56,7 @@ dev = [
     "mkl-devel>=2024",
     "ty>=0.0.1a1",
 ]
-docs = [
-    "zensical",
-    "mkdocstrings[python]>=0.26",
-]
+docs = ["zensical", "mkdocstrings[python]>=0.26"]
 
 [tool.uv]
 # See the comment in the dev dependency group above for why.
