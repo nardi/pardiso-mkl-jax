@@ -15,6 +15,7 @@ from cpython.pycapsule cimport PyCapsule_New
 cdef extern from "_pardiso_ffi.h":
     void* pardiso_factor_handler_address()
     void* pardiso_solve_handler_address()
+    void* pardiso_factor_solve_handler_address()
     void* pardiso_release_handler_address()
     void* pardiso_solve_once_handler_address()
     long pardiso_analysis_count(long solver_id)
@@ -35,6 +36,11 @@ def _register_targets():
     )
     jax.ffi.register_ffi_target(
         "pardiso_mkl_jax_solve", _capsule(pardiso_solve_handler_address()), platform="cpu"
+    )
+    jax.ffi.register_ffi_target(
+        "pardiso_mkl_jax_factor_solve",
+        _capsule(pardiso_factor_solve_handler_address()),
+        platform="cpu",
     )
     jax.ffi.register_ffi_target(
         "pardiso_mkl_jax_release", _capsule(pardiso_release_handler_address()), platform="cpu"

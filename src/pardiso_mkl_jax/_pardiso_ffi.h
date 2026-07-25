@@ -18,6 +18,12 @@ void* pardiso_factor_handler_address();
 // solver_id.
 void* pardiso_solve_handler_address();
 
+// Stateful handler for the fused numeric factorization and solve (phase 23),
+// reusing the analysis already produced for the same solver_id. Fusing the two
+// steps keeps them ordered under jit, where separate factor and solve calls
+// are not.
+void* pardiso_factor_solve_handler_address();
+
 // Releases the native memory associated with a solver_id and removes it from
 // the registry.
 void* pardiso_release_handler_address();

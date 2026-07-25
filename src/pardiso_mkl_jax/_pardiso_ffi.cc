@@ -201,6 +201,46 @@ ffi::Error PardisoSolveImpl(int64_t solver_id, int64_t matrix_type, int64_t dime
   return ffi::Error::Success();
 }
 
+// Numeric factorization and solve in a single call (combined phase 23),
+// reusing the symbolic analysis already produced for solver_id. Doing both in
+// one FFI call is what makes stateful reuse safe under jit: separate factor
+// and solve calls share no data dependency that XLA must respect, since the
+// factorization lives in native memory it cannot see, so it may run the solve
+// before the factor. Fusing them removes that hazard. The analysis (phase 11)
+// is not repeated, so analysis_count is left untouched.
+ffi::Error PardisoFactorSolveImpl(int64_t solver_id, int64_t matrix_type, int64_t dimension,
+                                   int64_t number_of_right_hand_sides, int64_t transpose_mode,
+                                   ffi::Buffer<ffi::S32> indptr, ffi::Buffer<ffi::S32> indices,
+                                   ffi::Buffer<ffi::F64> values,
+                                   ffi::Buffer<ffi::F64> right_hand_side,
+                                   ffi::ResultBuffer<ffi::F64> solution) {
+  std::lock_guard<std::mutex> lock(RegistryMutex());
+  PardisoState& state = GetOrCreateState(solver_id);
+  state.matrix_type = static_cast<MKL_INT>(matrix_type);
+  state.dimension = static_cast<MKL_INT>(dimension);
+  InitializeIparm(state.iparm, state.matrix_type);
+  // Set unconditionally, matching PardisoSolveImpl, so a later call without
+  // transpose is not left with a stale value from an earlier one.
+  state.iparm[11] = static_cast<MKL_INT>(transpose_mode);
+
+  MKL_INT maxfct = 1;
+  MKL_INT mnum = 1;
+  MKL_INT phase_value = 23;
+  MKL_INT nrhs = static_cast<MKL_INT>(number_of_right_hand_sides);
+  MKL_INT message_level = 0;
+  MKL_INT error = 0;
+
+  pardiso(state.handle, &maxfct, &mnum, &state.matrix_type, &phase_value, &state.dimension,
+          const_cast<double*>(values.typed_data()), AsMklInt(indptr.typed_data()),
+          AsMklInt(indices.typed_data()), /*perm=*/nullptr, &nrhs, state.iparm, &message_level,
+          const_cast<double*>(right_hand_side.typed_data()), solution->typed_data(), &error);
+
+  if (error != 0) {
+    return ffi::Error::Internal(PardisoErrorMessage("factor_and_solve", error));
+  }
+  return ffi::Error::Success();
+}
+
 // Frees the native memory for solver_id (phase -1) and drops it from the
 // registry. A solver_id that is not present is treated as already released.
 ffi::Error PardisoReleaseImpl(int64_t solver_id, ffi::ResultBuffer<ffi::S32> status) {
@@ -299,6 +339,20 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(kPardisoSolveHandler, PardisoSolveImpl,
                                    .Ret<ffi::Buffer<ffi::F64>>()  // solution
 );
 
+XLA_FFI_DEFINE_HANDLER_SYMBOL(kPardisoFactorSolveHandler, PardisoFactorSolveImpl,
+                               ffi::Ffi::Bind()
+                                   .Attr<int64_t>("solver_id")
+                                   .Attr<int64_t>("matrix_type")
+                                   .Attr<int64_t>("dimension")
+                                   .Attr<int64_t>("number_of_right_hand_sides")
+                                   .Attr<int64_t>("transpose_mode")
+                                   .Arg<ffi::Buffer<ffi::S32>>()  // indptr
+                                   .Arg<ffi::Buffer<ffi::S32>>()  // indices
+                                   .Arg<ffi::Buffer<ffi::F64>>()  // values
+                                   .Arg<ffi::Buffer<ffi::F64>>()  // right_hand_side
+                                   .Ret<ffi::Buffer<ffi::F64>>()  // solution
+);
+
 XLA_FFI_DEFINE_HANDLER_SYMBOL(kPardisoReleaseHandler, PardisoReleaseImpl,
                                ffi::Ffi::Bind()
                                    .Attr<int64_t>("solver_id")
@@ -328,6 +382,10 @@ extern "C" void* pardiso_factor_handler_address() {
 
 extern "C" void* pardiso_solve_handler_address() {
   return reinterpret_cast<void*>(pardiso_mkl_jax::kPardisoSolveHandler);
+}
+
+extern "C" void* pardiso_factor_solve_handler_address() {
+  return reinterpret_cast<void*>(pardiso_mkl_jax::kPardisoFactorSolveHandler);
 }
 
 extern "C" void* pardiso_release_handler_address() {
