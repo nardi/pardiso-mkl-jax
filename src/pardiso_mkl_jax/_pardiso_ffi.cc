@@ -3,9 +3,14 @@
 // Pardiso keeps its factorization in an opaque native handle ("pt") that
 // must persist across calls to be reused. XLA FFI calls are stateless from
 // JAX's point of view, so we keep a process-global registry mapping an
-// integer solver_id (chosen on the Python side) to the native state. This is
-// what lets a jit-compiled program call analyze once and factor/solve many
-// times without JAX ever seeing the native handle.
+// integer key to the native state. That key is itself threaded through JAX
+// as an ordinary int64 array value ("the handle"): analyze allocates a fresh
+// key and returns it, factor and solve take it as an input, and release
+// consumes it. Because every stage takes the previous stage's handle as
+// data, XLA orders the whole analyze -> factor -> solve -> release lifecycle
+// by data dependency, the same way it orders any other computation, so the
+// lifecycle can be expressed entirely inside a jit trace and each runtime
+// invocation of a compiled function gets its own registry entry.
 //
 // All buffers are read directly from the pointers XLA hands us. There is no
 // copying: the CSR arrays and right-hand sides passed in from Python flow
@@ -27,6 +32,7 @@
 #include <mkl_pardiso.h>
 #include <mkl_service.h>
 
+#include <atomic>
 #include <cstdint>
 #include <mutex>
 #include <string>
@@ -39,7 +45,7 @@ namespace ffi = xla::ffi;
 namespace pardiso_mkl_jax {
 namespace {
 
-// Native state for one solver_id: the opaque Pardiso handle, its parameter
+// Native state for one handle: the opaque Pardiso handle, its parameter
 // array, and a little bookkeeping used by tests to check that analysis is
 // only run when expected.
 struct PardisoState {
@@ -71,9 +77,13 @@ std::unordered_map<int64_t, PardisoState>& Registry() {
   return registry;
 }
 
-// Must be called while holding RegistryMutex.
-PardisoState& GetOrCreateState(int64_t solver_id) {
-  return Registry()[solver_id];
+// Monotonic source of fresh registry keys, allocated at runtime inside the
+// analyze handler rather than baked in at Python trace time. Never reused,
+// so two concurrent or repeated invocations of a compiled function each get
+// their own registry entry instead of colliding on a trace-time id.
+std::atomic<int64_t>& HandleCounter() {
+  static std::atomic<int64_t> counter{1};
+  return counter;
 }
 
 // Reinterprets a buffer of our zero-copy int32 CSR arrays as MKL_INT, the
@@ -110,15 +120,15 @@ std::string PardisoErrorMessage(const char* stage, MKL_INT error) {
 
 }  // namespace
 
-extern "C" long pardiso_analysis_count(long solver_id) {
+extern "C" long pardiso_analysis_count(long handle) {
   std::lock_guard<std::mutex> lock(RegistryMutex());
-  auto iterator = Registry().find(solver_id);
+  auto iterator = Registry().find(handle);
   return iterator == Registry().end() ? 0 : iterator->second.analysis_count;
 }
 
-extern "C" void pardiso_reset_analysis_count(long solver_id) {
+extern "C" void pardiso_reset_analysis_count(long handle) {
   std::lock_guard<std::mutex> lock(RegistryMutex());
-  auto iterator = Registry().find(solver_id);
+  auto iterator = Registry().find(handle);
   if (iterator != Registry().end()) {
     iterator->second.analysis_count = 0;
   }
@@ -126,22 +136,26 @@ extern "C" void pardiso_reset_analysis_count(long solver_id) {
 
 namespace {
 
-// Analyze (phase 11) and numeric factorization (phase 22). Both write into
-// the same persistent state, so factorization can be repeated for new values
-// on the same pattern without redoing the analysis.
-ffi::Error PardisoFactorImpl(int64_t solver_id, int64_t phase, int64_t matrix_type,
-                              int64_t dimension, ffi::Buffer<ffi::S32> indptr,
-                              ffi::Buffer<ffi::S32> indices, ffi::Buffer<ffi::F64> values,
-                              ffi::ResultBuffer<ffi::S32> status) {
+// Analyze (phase 11). Allocates a fresh registry key, runs the symbolic
+// factorization into a new PardisoState, and returns the key as an int64
+// handle value. Every later stage (factor, solve, release) takes this
+// handle as an ordinary input, which is what lets XLA order the lifecycle by
+// data dependency instead of by a static, trace-time-baked id.
+ffi::Error PardisoAnalyzeImpl(int64_t matrix_type, int64_t dimension,
+                               ffi::Buffer<ffi::S32> indptr, ffi::Buffer<ffi::S32> indices,
+                               ffi::Buffer<ffi::F64> values, ffi::ResultBuffer<ffi::S64> handle_out,
+                               ffi::ResultBuffer<ffi::S32> status) {
+  int64_t handle = HandleCounter().fetch_add(1);
+
   std::lock_guard<std::mutex> lock(RegistryMutex());
-  PardisoState& state = GetOrCreateState(solver_id);
+  PardisoState& state = Registry()[handle];
   state.matrix_type = static_cast<MKL_INT>(matrix_type);
   state.dimension = static_cast<MKL_INT>(dimension);
   InitializeIparm(state.iparm, state.matrix_type);
 
   MKL_INT maxfct = 1;
   MKL_INT mnum = 1;
-  MKL_INT phase_value = static_cast<MKL_INT>(phase);
+  MKL_INT phase_value = 11;
   MKL_INT number_of_right_hand_sides = 0;
   MKL_INT message_level = 0;
   MKL_INT error = 0;
@@ -151,9 +165,45 @@ ffi::Error PardisoFactorImpl(int64_t solver_id, int64_t phase, int64_t matrix_ty
           AsMklInt(indices.typed_data()), /*perm=*/nullptr, &number_of_right_hand_sides,
           state.iparm, &message_level, /*b=*/nullptr, /*x=*/nullptr, &error);
 
-  if (phase_value == 11) {
-    state.analysis_count += 1;
+  state.analysis_count += 1;
+  handle_out->typed_data()[0] = handle;
+  status->typed_data()[0] = static_cast<int32_t>(error);
+  if (error != 0) {
+    return ffi::Error::Internal(PardisoErrorMessage("analyze", error));
   }
+  return ffi::Error::Success();
+}
+
+// Numeric factorization (phase 22) against the state already allocated by
+// analyze for this handle. Returns the same handle unchanged, so a later
+// solve that takes this handler's output as input is ordered after the
+// factorization.
+ffi::Error PardisoFactorImpl(int64_t matrix_type, int64_t dimension,
+                              ffi::Buffer<ffi::S64> handle_in, ffi::Buffer<ffi::S32> indptr,
+                              ffi::Buffer<ffi::S32> indices, ffi::Buffer<ffi::F64> values,
+                              ffi::ResultBuffer<ffi::S64> handle_out,
+                              ffi::ResultBuffer<ffi::S32> status) {
+  int64_t handle = handle_in.typed_data()[0];
+
+  std::lock_guard<std::mutex> lock(RegistryMutex());
+  PardisoState& state = Registry()[handle];
+  state.matrix_type = static_cast<MKL_INT>(matrix_type);
+  state.dimension = static_cast<MKL_INT>(dimension);
+  InitializeIparm(state.iparm, state.matrix_type);
+
+  MKL_INT maxfct = 1;
+  MKL_INT mnum = 1;
+  MKL_INT phase_value = 22;
+  MKL_INT number_of_right_hand_sides = 0;
+  MKL_INT message_level = 0;
+  MKL_INT error = 0;
+
+  pardiso(state.handle, &maxfct, &mnum, &state.matrix_type, &phase_value, &state.dimension,
+          const_cast<double*>(values.typed_data()), AsMklInt(indptr.typed_data()),
+          AsMklInt(indices.typed_data()), /*perm=*/nullptr, &number_of_right_hand_sides,
+          state.iparm, &message_level, /*b=*/nullptr, /*x=*/nullptr, &error);
+
+  handle_out->typed_data()[0] = handle;
   status->typed_data()[0] = static_cast<int32_t>(error);
   if (error != 0) {
     return ffi::Error::Internal(PardisoErrorMessage("factor", error));
@@ -161,25 +211,28 @@ ffi::Error PardisoFactorImpl(int64_t solver_id, int64_t phase, int64_t matrix_ty
   return ffi::Error::Success();
 }
 
-// Solve (phase 33) against a factorization already produced for solver_id.
+// Solve (phase 33) against a factorization already produced for handle.
 // transpose_mode is iparm[11] directly: 0 solves Ax = b, 2 solves A^T x = b
 // (conjugate transpose, value 1, coincides with plain transpose for the
 // real-valued matrices this package supports). Reuses the same
 // factorization either way: an LU (or LDL^T) factorization of A supports
 // solving with A^T through forward/back substitution in the opposite
 // order, with no need to refactorize.
-ffi::Error PardisoSolveImpl(int64_t solver_id, int64_t matrix_type, int64_t dimension,
+ffi::Error PardisoSolveImpl(int64_t matrix_type, int64_t dimension,
                              int64_t number_of_right_hand_sides, int64_t transpose_mode,
-                             ffi::Buffer<ffi::S32> indptr, ffi::Buffer<ffi::S32> indices,
-                             ffi::Buffer<ffi::F64> values, ffi::Buffer<ffi::F64> right_hand_side,
+                             ffi::Buffer<ffi::S64> handle_in, ffi::Buffer<ffi::S32> indptr,
+                             ffi::Buffer<ffi::S32> indices, ffi::Buffer<ffi::F64> values,
+                             ffi::Buffer<ffi::F64> right_hand_side,
                              ffi::ResultBuffer<ffi::F64> solution) {
+  int64_t handle = handle_in.typed_data()[0];
+
   std::lock_guard<std::mutex> lock(RegistryMutex());
-  PardisoState& state = GetOrCreateState(solver_id);
+  PardisoState& state = Registry()[handle];
   state.matrix_type = static_cast<MKL_INT>(matrix_type);
   state.dimension = static_cast<MKL_INT>(dimension);
   InitializeIparm(state.iparm, state.matrix_type);
   // Set unconditionally (not only when transposed) so a later solve on the
-  // same solver_id without transpose is not left with a stale value from an
+  // same handle without transpose is not left with a stale value from an
   // earlier call.
   state.iparm[11] = static_cast<MKL_INT>(transpose_mode);
 
@@ -202,20 +255,21 @@ ffi::Error PardisoSolveImpl(int64_t solver_id, int64_t matrix_type, int64_t dime
 }
 
 // Numeric factorization and solve in a single call (combined phase 23),
-// reusing the symbolic analysis already produced for solver_id. Doing both in
-// one FFI call is what makes stateful reuse safe under jit: separate factor
-// and solve calls share no data dependency that XLA must respect, since the
-// factorization lives in native memory it cannot see, so it may run the solve
-// before the factor. Fusing them removes that hazard. The analysis (phase 11)
-// is not repeated, so analysis_count is left untouched.
-ffi::Error PardisoFactorSolveImpl(int64_t solver_id, int64_t matrix_type, int64_t dimension,
+// reusing the symbolic analysis already produced for handle. Doing both in
+// one FFI call keeps stateful reuse safe even when the handle otherwise
+// carries the ordering, since it also collapses two native calls that touch
+// the same registry entry into one. The analysis (phase 11) is not
+// repeated, so analysis_count is left untouched.
+ffi::Error PardisoFactorSolveImpl(int64_t matrix_type, int64_t dimension,
                                    int64_t number_of_right_hand_sides, int64_t transpose_mode,
-                                   ffi::Buffer<ffi::S32> indptr, ffi::Buffer<ffi::S32> indices,
-                                   ffi::Buffer<ffi::F64> values,
+                                   ffi::Buffer<ffi::S64> handle_in, ffi::Buffer<ffi::S32> indptr,
+                                   ffi::Buffer<ffi::S32> indices, ffi::Buffer<ffi::F64> values,
                                    ffi::Buffer<ffi::F64> right_hand_side,
                                    ffi::ResultBuffer<ffi::F64> solution) {
+  int64_t handle = handle_in.typed_data()[0];
+
   std::lock_guard<std::mutex> lock(RegistryMutex());
-  PardisoState& state = GetOrCreateState(solver_id);
+  PardisoState& state = Registry()[handle];
   state.matrix_type = static_cast<MKL_INT>(matrix_type);
   state.dimension = static_cast<MKL_INT>(dimension);
   InitializeIparm(state.iparm, state.matrix_type);
@@ -241,11 +295,13 @@ ffi::Error PardisoFactorSolveImpl(int64_t solver_id, int64_t matrix_type, int64_
   return ffi::Error::Success();
 }
 
-// Frees the native memory for solver_id (phase -1) and drops it from the
-// registry. A solver_id that is not present is treated as already released.
-ffi::Error PardisoReleaseImpl(int64_t solver_id, ffi::ResultBuffer<ffi::S32> status) {
+// Frees the native memory for handle (phase -1) and drops it from the
+// registry. A handle that is not present is treated as already released.
+ffi::Error PardisoReleaseImpl(ffi::Buffer<ffi::S64> handle_in, ffi::ResultBuffer<ffi::S32> status) {
+  int64_t handle = handle_in.typed_data()[0];
+
   std::lock_guard<std::mutex> lock(RegistryMutex());
-  auto iterator = Registry().find(solver_id);
+  auto iterator = Registry().find(handle);
   if (iterator == Registry().end()) {
     status->typed_data()[0] = 0;
     return ffi::Error::Success();
@@ -313,25 +369,36 @@ ffi::Error PardisoSolveOnceImpl(int64_t matrix_type, int64_t dimension,
   return ffi::Error::Success();
 }
 
-XLA_FFI_DEFINE_HANDLER_SYMBOL(kPardisoFactorHandler, PardisoFactorImpl,
+XLA_FFI_DEFINE_HANDLER_SYMBOL(kPardisoAnalyzeHandler, PardisoAnalyzeImpl,
                                ffi::Ffi::Bind()
-                                   .Attr<int64_t>("solver_id")
-                                   .Attr<int64_t>("phase")
                                    .Attr<int64_t>("matrix_type")
                                    .Attr<int64_t>("dimension")
                                    .Arg<ffi::Buffer<ffi::S32>>()  // indptr
                                    .Arg<ffi::Buffer<ffi::S32>>()  // indices
                                    .Arg<ffi::Buffer<ffi::F64>>()  // values
+                                   .Ret<ffi::Buffer<ffi::S64>>()  // handle
+                                   .Ret<ffi::Buffer<ffi::S32>>()  // status
+);
+
+XLA_FFI_DEFINE_HANDLER_SYMBOL(kPardisoFactorHandler, PardisoFactorImpl,
+                               ffi::Ffi::Bind()
+                                   .Attr<int64_t>("matrix_type")
+                                   .Attr<int64_t>("dimension")
+                                   .Arg<ffi::Buffer<ffi::S64>>()  // handle
+                                   .Arg<ffi::Buffer<ffi::S32>>()  // indptr
+                                   .Arg<ffi::Buffer<ffi::S32>>()  // indices
+                                   .Arg<ffi::Buffer<ffi::F64>>()  // values
+                                   .Ret<ffi::Buffer<ffi::S64>>()  // handle
                                    .Ret<ffi::Buffer<ffi::S32>>()  // status
 );
 
 XLA_FFI_DEFINE_HANDLER_SYMBOL(kPardisoSolveHandler, PardisoSolveImpl,
                                ffi::Ffi::Bind()
-                                   .Attr<int64_t>("solver_id")
                                    .Attr<int64_t>("matrix_type")
                                    .Attr<int64_t>("dimension")
                                    .Attr<int64_t>("number_of_right_hand_sides")
                                    .Attr<int64_t>("transpose_mode")
+                                   .Arg<ffi::Buffer<ffi::S64>>()  // handle
                                    .Arg<ffi::Buffer<ffi::S32>>()  // indptr
                                    .Arg<ffi::Buffer<ffi::S32>>()  // indices
                                    .Arg<ffi::Buffer<ffi::F64>>()  // values
@@ -341,11 +408,11 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(kPardisoSolveHandler, PardisoSolveImpl,
 
 XLA_FFI_DEFINE_HANDLER_SYMBOL(kPardisoFactorSolveHandler, PardisoFactorSolveImpl,
                                ffi::Ffi::Bind()
-                                   .Attr<int64_t>("solver_id")
                                    .Attr<int64_t>("matrix_type")
                                    .Attr<int64_t>("dimension")
                                    .Attr<int64_t>("number_of_right_hand_sides")
                                    .Attr<int64_t>("transpose_mode")
+                                   .Arg<ffi::Buffer<ffi::S64>>()  // handle
                                    .Arg<ffi::Buffer<ffi::S32>>()  // indptr
                                    .Arg<ffi::Buffer<ffi::S32>>()  // indices
                                    .Arg<ffi::Buffer<ffi::F64>>()  // values
@@ -355,7 +422,7 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(kPardisoFactorSolveHandler, PardisoFactorSolveImpl
 
 XLA_FFI_DEFINE_HANDLER_SYMBOL(kPardisoReleaseHandler, PardisoReleaseImpl,
                                ffi::Ffi::Bind()
-                                   .Attr<int64_t>("solver_id")
+                                   .Arg<ffi::Buffer<ffi::S64>>()  // handle
                                    .Ret<ffi::Buffer<ffi::S32>>()  // status
 );
 
@@ -375,6 +442,10 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(kPardisoSolveOnceHandler, PardisoSolveOnceImpl,
 }  // namespace
 
 }  // namespace pardiso_mkl_jax
+
+extern "C" void* pardiso_analyze_handler_address() {
+  return reinterpret_cast<void*>(pardiso_mkl_jax::kPardisoAnalyzeHandler);
+}
 
 extern "C" void* pardiso_factor_handler_address() {
   return reinterpret_cast<void*>(pardiso_mkl_jax::kPardisoFactorHandler);

@@ -13,13 +13,14 @@ from cpython.pycapsule cimport PyCapsule_New
 
 
 cdef extern from "_pardiso_ffi.h":
+    void* pardiso_analyze_handler_address()
     void* pardiso_factor_handler_address()
     void* pardiso_solve_handler_address()
     void* pardiso_factor_solve_handler_address()
     void* pardiso_release_handler_address()
     void* pardiso_solve_once_handler_address()
-    long pardiso_analysis_count(long solver_id)
-    void pardiso_reset_analysis_count(long solver_id)
+    long pardiso_analysis_count(long handle)
+    void pardiso_reset_analysis_count(long handle)
 
 
 cdef object _capsule(void* address):
@@ -31,6 +32,9 @@ cdef object _capsule(void* address):
 def _register_targets():
     import jax
 
+    jax.ffi.register_ffi_target(
+        "pardiso_mkl_jax_analyze", _capsule(pardiso_analyze_handler_address()), platform="cpu"
+    )
     jax.ffi.register_ffi_target(
         "pardiso_mkl_jax_factor", _capsule(pardiso_factor_handler_address()), platform="cpu"
     )
@@ -55,11 +59,15 @@ def _register_targets():
 _register_targets()
 
 
-def analysis_count(solver_id):
-    """Number of analysis (phase 11) calls run for solver_id. Test hook."""
-    return pardiso_analysis_count(solver_id)
+def analysis_count(handle):
+    """Number of analysis (phase 11) calls run for handle. Test hook.
+
+    handle may be a plain int or a JAX/NumPy scalar array, as returned by
+    analyze(), so it is coerced through int() before reaching the C function.
+    """
+    return pardiso_analysis_count(int(handle))
 
 
-def reset_analysis_count(solver_id):
-    """Reset the analysis call counter for solver_id. Test hook."""
-    pardiso_reset_analysis_count(solver_id)
+def reset_analysis_count(handle):
+    """Reset the analysis call counter for handle. Test hook."""
+    pardiso_reset_analysis_count(int(handle))

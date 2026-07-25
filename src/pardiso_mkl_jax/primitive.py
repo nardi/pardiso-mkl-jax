@@ -1,12 +1,17 @@
 """Low-level JAX bindings for the compiled Pardiso FFI targets.
 
 Wraps each XLA custom call target registered by _ffi.pyx as a plain JAX
-function. `factor`, `solve_stateful`, and `release` operate on a persistent
-native factorization identified by an integer solver_id, and back the
-PardisoSolver class in solver.py. `solve` is the stateless, functional
-one-shot entry point, and carries a custom vmap rule so that batching over
-right-hand sides, matrix values, or both stays close to what native Pardiso
-calls can do, instead of falling back to a naive per-example Python loop.
+function. `analyze`, `factor`, `solve_stateful`, and `release` operate on a
+persistent native factorization identified by a handle, an ordinary int64
+JAX array value returned by `analyze` and threaded through every later call,
+and back the PardisoSolver class in solver.py. Because the handle is a JAX
+value rather than a Python-side id baked in at trace time, XLA orders
+analyze, factor, solve, and release by the same data dependencies it uses
+for any other computation, so the whole lifecycle can run inside a jitted
+function. `solve` is the stateless, functional one-shot entry point, and
+carries a custom vmap rule so that batching over right-hand sides, matrix
+values, or both stays close to what native Pardiso calls can do, instead of
+falling back to a naive per-example Python loop.
 
 Right-hand-side and solution buffers are shaped (num_right_hand_sides, n)
 throughout this module, not (n, num_right_hand_sides). Pardiso itself stores
@@ -19,8 +24,6 @@ _pardiso_ffi.cc for the full explanation.
 from __future__ import annotations
 
 import functools
-import itertools
-import threading
 
 import jax
 import jax.numpy as jnp
@@ -34,12 +37,6 @@ from pardiso_mkl_jax.matrix import (
     check_upper_triangular,
 )
 
-# Pardiso phase codes used from Python. 13 (combined analyze, factor, solve)
-# lives next to its handler in _pardiso_ffi.cc instead, since the stateless
-# one-shot path never varies its phase.
-PHASE_ANALYZE = 11
-PHASE_FACTORIZE = 22
-
 # iparm[11] values controlling which system a solve step solves. TRANSPOSE
 # is Pardiso's "transposed" mode (as opposed to "conjugate transposed",
 # value 1), which coincides with it anyway for the real-valued matrices
@@ -52,58 +49,74 @@ def _transpose_mode(transpose: bool) -> np.int64:
     return np.int64(TRANSPOSE_TRANSPOSE if transpose else TRANSPOSE_NONE)
 
 
-_solver_id_lock = threading.Lock()
-_solver_id_counter = itertools.count(1)
+def analyze(indptr, indices, values, *, matrix_type: MatrixType):
+    """Run the analyze (phase 11) step and allocate a fresh native factorization.
 
-
-def allocate_solver_id() -> int:
-    """Return a fresh integer id, unique for the process, for the native state registry.
-
-    A monotonic counter is enough: ids are never reused, so a live solver can
-    never collide with one that has since been released.
-    """
-    with _solver_id_lock:
-        return next(_solver_id_counter)
-
-
-def factor(indptr, indices, values, *, solver_id: int, phase: int, matrix_type: MatrixType):
-    """Run the analyze (phase 11) or numeric factorization (phase 22) step.
-
-    Mutates the native state kept for solver_id and returns a status code (0
-    means success; a non-zero Pardiso error code also raises before this
-    returns, so callers mainly use the status for logging).
+    Returns the handle for the new factorization, an int64 array value that
+    every later call (factor, solve_stateful, factor_and_solve_stateful,
+    release) takes as an input. Threading the handle as data, rather than
+    addressing the native state by a Python-side id, is what lets XLA order
+    the whole analyze-factor-solve-release lifecycle and lets it run inside a
+    jitted function.
     """
     dimension = indptr.shape[0] - 1
-    return jax.ffi.ffi_call(
-        "pardiso_mkl_jax_factor",
-        jax.ShapeDtypeStruct((), jnp.int32),
+    handle, _status = jax.ffi.ffi_call(
+        "pardiso_mkl_jax_analyze",
+        (
+            jax.ShapeDtypeStruct((), jnp.int64),
+            jax.ShapeDtypeStruct((), jnp.int32),
+        ),
         has_side_effect=True,
     )(
         indptr,
         indices,
         values,
-        solver_id=np.int64(solver_id),
-        phase=np.int64(phase),
         matrix_type=np.int64(matrix_type),
         dimension=np.int64(dimension),
     )
+    return handle
+
+
+def factor(handle, indptr, indices, values, *, matrix_type: MatrixType):
+    """Run the numeric factorization (phase 22) step against handle.
+
+    Returns handle unchanged, so a later call that consumes this function's
+    return value is ordered after the factorization it performed.
+    """
+    dimension = indptr.shape[0] - 1
+    handle_out, _status = jax.ffi.ffi_call(
+        "pardiso_mkl_jax_factor",
+        (
+            jax.ShapeDtypeStruct((), jnp.int64),
+            jax.ShapeDtypeStruct((), jnp.int32),
+        ),
+        has_side_effect=True,
+    )(
+        handle,
+        indptr,
+        indices,
+        values,
+        matrix_type=np.int64(matrix_type),
+        dimension=np.int64(dimension),
+    )
+    return handle_out
 
 
 def solve_stateful(
+    handle,
     indptr,
     indices,
     values,
     right_hand_side,
     *,
-    solver_id: int,
     matrix_type: MatrixType,
     transpose: bool = False,
 ):
-    """Solve (phase 33) against a factorization already produced for solver_id.
+    """Solve (phase 33) against the factorization already produced for handle.
 
     transpose solves A^T x = right_hand_side instead of A x = right_hand_side,
     reusing the same factorization: no call to factor() is needed to switch
-    between the two for a given solver_id.
+    between the two for a given handle.
     """
     dimension = indptr.shape[0] - 1
     number_of_right_hand_sides = right_hand_side.shape[0]
@@ -112,11 +125,11 @@ def solve_stateful(
         jax.ShapeDtypeStruct(right_hand_side.shape, jnp.float64),
         has_side_effect=True,
     )(
+        handle,
         indptr,
         indices,
         values,
         right_hand_side,
-        solver_id=np.int64(solver_id),
         matrix_type=np.int64(matrix_type),
         dimension=np.int64(dimension),
         number_of_right_hand_sides=np.int64(number_of_right_hand_sides),
@@ -125,16 +138,16 @@ def solve_stateful(
 
 
 def factor_and_solve_stateful(
+    handle,
     indptr,
     indices,
     values,
     right_hand_side,
     *,
-    solver_id: int,
     matrix_type: MatrixType,
     transpose: bool = False,
 ):
-    """Refactor and solve in one call, reusing the analysis produced for solver_id.
+    """Refactor and solve in one call, reusing the analysis produced for handle.
 
     Runs Pardiso's combined phase 23 (numeric factorization then solve) for the
     given values against the stored analysis. This is a single FFI call, so the
@@ -149,11 +162,11 @@ def factor_and_solve_stateful(
         jax.ShapeDtypeStruct(right_hand_side.shape, jnp.float64),
         has_side_effect=True,
     )(
+        handle,
         indptr,
         indices,
         values,
         right_hand_side,
-        solver_id=np.int64(solver_id),
         matrix_type=np.int64(matrix_type),
         dimension=np.int64(dimension),
         number_of_right_hand_sides=np.int64(number_of_right_hand_sides),
@@ -161,13 +174,13 @@ def factor_and_solve_stateful(
     )
 
 
-def release(*, solver_id: int):
-    """Free the native factorization state for solver_id."""
+def release(handle):
+    """Free the native factorization state for handle."""
     return jax.ffi.ffi_call(
         "pardiso_mkl_jax_release",
         jax.ShapeDtypeStruct((), jnp.int32),
         has_side_effect=True,
-    )(solver_id=np.int64(solver_id))
+    )(handle)
 
 
 def _solve_once(
@@ -188,16 +201,6 @@ def _solve_once(
         dimension=np.int64(dimension),
         number_of_right_hand_sides=np.int64(number_of_right_hand_sides),
         transpose_mode=_transpose_mode(transpose),
-    )
-
-
-def _factor_shared_pattern(indptr, indices, values, *, solver_id: int, matrix_type: MatrixType):
-    """Analyze once, then factor with the given values. Used to start a batch loop."""
-    factor(
-        indptr, indices, values, solver_id=solver_id, phase=PHASE_ANALYZE, matrix_type=matrix_type
-    )
-    factor(
-        indptr, indices, values, solver_id=solver_id, phase=PHASE_FACTORIZE, matrix_type=matrix_type
     )
 
 
@@ -268,21 +271,14 @@ def _make_solve_core(matrix_type: MatrixType, transpose: bool):
             # numeric values for scaling and matching, so the choice of
             # representative values can affect pivoting quality, though not
             # correctness), then each matrix is factored and solved in turn.
-            solver_id = allocate_solver_id()
+            handle = analyze(indptr, indices, values[0], matrix_type=matrix_type)
             try:
-                _factor_shared_pattern(
-                    indptr, indices, values[0], solver_id=solver_id, matrix_type=matrix_type
-                )
+                handle = factor(handle, indptr, indices, values[0], matrix_type=matrix_type)
                 solutions = []
                 for index in range(axis_size):
                     if index > 0:
-                        factor(
-                            indptr,
-                            indices,
-                            values[index],
-                            solver_id=solver_id,
-                            phase=PHASE_FACTORIZE,
-                            matrix_type=matrix_type,
+                        handle = factor(
+                            handle, indptr, indices, values[index], matrix_type=matrix_type
                         )
                     current_right_hand_side = (
                         right_hand_side[index][None, :]
@@ -290,17 +286,17 @@ def _make_solve_core(matrix_type: MatrixType, transpose: bool):
                         else right_hand_side[None, :]
                     )
                     solution = solve_stateful(
+                        handle,
                         indptr,
                         indices,
                         values[index],
                         current_right_hand_side,
-                        solver_id=solver_id,
                         matrix_type=matrix_type,
                         transpose=transpose,
                     )
                     solutions.append(solution[0])
             finally:
-                release(solver_id=solver_id)
+                release(handle)
             return jnp.stack(solutions), True
 
         # Neither values nor right_hand_side is batched. custom_vmap can
