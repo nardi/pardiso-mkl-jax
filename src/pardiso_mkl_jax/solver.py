@@ -28,6 +28,11 @@ class PardisoSolver:
       the reuse explicit at the call site.
     - solve() solves against whatever factorization is currently stored, and
       requires a prior factorize().
+    - refactor_and_solve() factorizes for new values and solves in one call,
+      reusing the analysis and requiring only a prior analyze(). It keeps no
+      reference to the values, so unlike factorize() plus solve() it is safe
+      to call from inside a jitted function where the values and right-hand
+      side are tracers.
 
     PardisoSolver must be used as a context manager. Its native memory is
     released in __exit__, not in a destructor: Python does not guarantee when
@@ -146,6 +151,34 @@ class PardisoSolver:
             self._indptr,
             self._indices,
             self._values,
+            stacked_right_hand_side,
+            solver_id=self._solver_id,
+            matrix_type=self._matrix_type,
+            transpose=transpose,
+        )
+        return solution[0]
+
+    def refactor_and_solve(self, values, right_hand_side, *, transpose: bool = False):
+        """Factorize for values and solve in one call, reusing the analysis.
+
+        Requires a prior analyze(). Runs the numeric factorization and the
+        solve as one combined Pardiso step (phase 23), reusing the symbolic
+        analysis rather than re-running it. Because it is a single FFI call it
+        stays correct inside a jitted function, where a separate factorize()
+        and solve() would not be ordered, and it keeps no reference to values
+        on the solver, so values and right_hand_side may be tracers.
+
+        Solves against A^T instead of A when transpose is set.
+        """
+        self._check_usable()
+        if not self._analyzed:
+            raise RuntimeError("refactor_and_solve() requires analyze() to have been called first.")
+        check_csr_arrays(self._indptr, self._indices, values)
+        stacked_right_hand_side = right_hand_side[None, :]
+        solution = primitive.factor_and_solve_stateful(
+            self._indptr,
+            self._indices,
+            values,
             stacked_right_hand_side,
             solver_id=self._solver_id,
             matrix_type=self._matrix_type,

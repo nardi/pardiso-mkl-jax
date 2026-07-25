@@ -4,6 +4,7 @@ and the separation between analyze, factorize, refactorize, and solve.
 
 from __future__ import annotations
 
+import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
@@ -88,6 +89,59 @@ def test_refactorize_updates_values_without_reanalyzing(system):
         solution = solver.solve(jnp.asarray(right_hand_side))
         expected = np.linalg.solve(dense * 2.0, right_hand_side)
         np.testing.assert_allclose(np.asarray(solution), expected, rtol=1e-8, atol=1e-10)
+
+
+def test_refactor_and_solve_reuses_analysis_under_jit(system):
+    """refactor_and_solve runs inside jit and reuses the analysis across value changes.
+
+    This is the path that factorize() plus solve() cannot take: the latter stores the
+    values on the solver, which leaks a tracer out of the jit. refactor_and_solve passes
+    them explicitly, so a jitted call with fresh values reuses the analysis and stays
+    correct without re-analyzing.
+    """
+    matrix_type, indptr, indices, values, dense, right_hand_side = system
+    with pmj.PardisoSolver(
+        jnp.asarray(indptr), jnp.asarray(indices), matrix_type=matrix_type
+    ) as solver:
+        solver.analyze(jnp.asarray(values))
+        assert _ffi.analysis_count(solver._solver_id) == 1
+
+        run = jax.jit(lambda v, b: solver.refactor_and_solve(v, b))
+        first = run(jnp.asarray(values), jnp.asarray(right_hand_side))
+        second = run(jnp.asarray(values * 2.0), jnp.asarray(right_hand_side))
+        assert _ffi.analysis_count(solver._solver_id) == 1
+
+    np.testing.assert_allclose(
+        np.asarray(first), np.linalg.solve(dense, right_hand_side), rtol=1e-8, atol=1e-10
+    )
+    np.testing.assert_allclose(
+        np.asarray(second),
+        np.linalg.solve(dense * 2.0, right_hand_side),
+        rtol=1e-8,
+        atol=1e-10,
+    )
+
+
+def test_refactor_and_solve_transpose_matches_dense(system):
+    matrix_type, indptr, indices, values, dense, right_hand_side = system
+    with pmj.PardisoSolver(
+        jnp.asarray(indptr), jnp.asarray(indices), matrix_type=matrix_type
+    ) as solver:
+        solver.analyze(jnp.asarray(values))
+        solution = solver.refactor_and_solve(
+            jnp.asarray(values), jnp.asarray(right_hand_side), transpose=True
+        )
+    expected = np.linalg.solve(dense.T, right_hand_side)
+    np.testing.assert_allclose(np.asarray(solution), expected, rtol=1e-8, atol=1e-10)
+
+
+def test_refactor_and_solve_requires_prior_analyze(any_system):
+    indptr, indices, values, _dense, right_hand_side = any_system
+    with pmj.PardisoSolver(
+        jnp.asarray(indptr), jnp.asarray(indices), matrix_type=pmj.MatrixType.REAL_NONSYMMETRIC
+    ) as solver:
+        with pytest.raises(RuntimeError, match="analyze"):
+            solver.refactor_and_solve(jnp.asarray(values), jnp.asarray(right_hand_side))
 
 
 def test_many_create_close_cycles_do_not_leak(system):

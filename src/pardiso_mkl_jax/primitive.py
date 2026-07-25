@@ -124,6 +124,43 @@ def solve_stateful(
     )
 
 
+def factor_and_solve_stateful(
+    indptr,
+    indices,
+    values,
+    right_hand_side,
+    *,
+    solver_id: int,
+    matrix_type: MatrixType,
+    transpose: bool = False,
+):
+    """Refactor and solve in one call, reusing the analysis produced for solver_id.
+
+    Runs Pardiso's combined phase 23 (numeric factorization then solve) for the
+    given values against the stored analysis. This is a single FFI call, so the
+    factorization and the solve stay ordered under jit, unlike a factor()
+    followed by a separate solve_stateful(): those share no data dependency XLA
+    must honor, so the solve could otherwise run before the factor.
+    """
+    dimension = indptr.shape[0] - 1
+    number_of_right_hand_sides = right_hand_side.shape[0]
+    return jax.ffi.ffi_call(
+        "pardiso_mkl_jax_factor_solve",
+        jax.ShapeDtypeStruct(right_hand_side.shape, jnp.float64),
+        has_side_effect=True,
+    )(
+        indptr,
+        indices,
+        values,
+        right_hand_side,
+        solver_id=np.int64(solver_id),
+        matrix_type=np.int64(matrix_type),
+        dimension=np.int64(dimension),
+        number_of_right_hand_sides=np.int64(number_of_right_hand_sides),
+        transpose_mode=_transpose_mode(transpose),
+    )
+
+
 def release(*, solver_id: int):
     """Free the native factorization state for solver_id."""
     return jax.ffi.ffi_call(
