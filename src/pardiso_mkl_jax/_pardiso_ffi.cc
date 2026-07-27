@@ -94,24 +94,47 @@ MKL_INT* AsMklInt(const int32_t* data) {
   return const_cast<MKL_INT*>(reinterpret_cast<const MKL_INT*>(data));
 }
 
-// Fills iparm with this package's safe defaults. iparm[0] is set to 1 (every
-// entry supplied explicitly) rather than left at 0 (let MKL fill in its own
-// defaults), because MKL's own default for non-symmetric matrices enables
-// weighted matching (iparm[12] = 1), and that heuristic segfaults inside
-// mkl_pds_lp64_kuhn_munkres in this MKL build, reproduced with a minimal
-// standalone Pardiso call outside this package entirely, on ordinary,
-// well-conditioned matrices, not just degenerate ones. Individually
-// overriding iparm[12] back to 0 while leaving iparm[0] at 0 does not avoid
-// the crash: MKL resets it internally before the matching step runs. Taking
-// over iparm[0] = 1 is the only way to keep it disabled. Scaling (iparm[10])
-// is unaffected by this bug and left enabled for non-symmetric matrices.
+// Fills iparm with this package's defaults. iparm[0] is set to 1, meaning
+// every entry below is used exactly as given and MKL fills nothing in
+// itself. That takeover is what lets us set iparm[34] (zero-based indexing)
+// and iparm[11] (transpose solves) and rely on them surviving, but it comes
+// with a sharp edge: every entry we do not assign stays at the 0 this array
+// was zero-initialized to, which is *not* the same as the default MKL would
+// have chosen. So each entry whose MKL default is non-zero has to be
+// restated here explicitly, per matrix type, or it is silently turned off.
+//
+// The values below reproduce pardisoinit's defaults for every matrix type
+// this package supports, with two deliberate exceptions, both noted inline:
+// iparm[1] and the reporting-only entries iparm[17] / iparm[18].
 void InitializeIparm(MKL_INT* iparm, MKL_INT matrix_type) {
+  const bool nonsymmetric = matrix_type == 11 || matrix_type == 13;
+  const bool symmetric_indefinite =
+      matrix_type == -2 || matrix_type == -4 || matrix_type == 6;
+
   iparm[0] = 1;  // every entry below is used as given, MKL fills nothing in
-  iparm[1] = 2;  // nested dissection (METIS-based) fill-reducing ordering
+  // Serial nested dissection, rather than pardisoinit's parallel nested
+  // dissection (3). The only entry here chosen for its own sake: it makes
+  // the fill-reducing ordering, and so the whole factorization, reproducible
+  // run to run regardless of thread count.
+  iparm[1] = 2;
+  iparm[7] = 2;  // iterative refinement steps, the backstop for perturbed pivots
   iparm[9] = (matrix_type == 11 || matrix_type == 1) ? 13 : 8;  // pivot perturbation exponent
-  iparm[10] = (matrix_type == 11) ? 1 : 0;  // scaling, non-symmetric matrices only
-  iparm[12] = 0;  // weighted matching disabled: see the crash explained above
+  iparm[10] = nonsymmetric ? 1 : 0;  // scaling, non-symmetric matrices only
+  // Weighted matching: permutes large entries onto the diagonal before
+  // factoring. Enabled for non-symmetric matrices, as pardisoinit does.
+  // Without it, a matrix with zeros on its diagonal (common for the
+  // saddle-point and constraint blocks this solver is used on) drives
+  // Pardiso into pivot perturbation, and it then happily returns a solution
+  // with a large residual and no error code at all.
+  iparm[12] = nonsymmetric ? 1 : 0;
+  // Bunch-Kaufman pivoting for symmetric indefinite matrices, which need it
+  // for the same reason: without it, a zero diagonal entry has no 2x2 pivot
+  // to fall back on and gets perturbed instead.
+  iparm[20] = symmetric_indefinite ? 1 : 0;
   iparm[34] = 1;  // zero-based indexing, so our CSR arrays need no reindexing
+  // iparm[17] and iparm[18] are left at 0 rather than pardisoinit's -1: both
+  // only request statistics (non-zeros in the factors, MFLOP count) that
+  // this package does not surface, and computing them is not free.
 }
 
 std::string PardisoErrorMessage(const char* stage, MKL_INT error) {

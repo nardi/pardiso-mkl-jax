@@ -136,6 +136,43 @@ def random_symmetric_indefinite_csr(dimension: int, density: float, seed: int):
     )
 
 
+def zero_diagonal_saddle_point_csr(dimension: int, density: float, seed: int):
+    """A nonsymmetric saddle-point matrix whose leading block has an all-zero diagonal.
+
+    Every other builder here is diagonally dominant, which is the easiest
+    case Pardiso has and hides the whole question of how it finds its
+    pivots. This one is deliberately the opposite: `[[0, B], [B.T, -C]]`,
+    so half its diagonal entries are structurally zero and Pardiso has to
+    permute large entries onto the diagonal (iparm[12], weighted matching)
+    to factor it stably. Without that, it perturbs the tiny pivots it finds
+    instead and returns a solution with a large residual and no error code,
+    which is exactly the failure this fixture exists to catch. The matrix
+    is still well conditioned (around 2e3), so the reference solution is
+    not in doubt.
+    """
+    random_state = np.random.default_rng(seed)
+    half = dimension // 2
+    off_diagonal_block = scipy.sparse.random(
+        half, half, density=density, random_state=random_state, format="csr"
+    ).toarray()
+    assert np.linalg.matrix_rank(off_diagonal_block) == half, "off-diagonal block is singular"
+    lower_right_block = np.diag(random_state.uniform(0.5, 1.5, size=half))
+    dense = np.block(
+        [
+            [np.zeros((half, half)), off_diagonal_block],
+            [off_diagonal_block.T, -lower_right_block],
+        ]
+    )
+    assert (np.diagonal(dense)[:half] == 0.0).all(), "leading diagonal block is not zero"
+    sparse = scipy.sparse.csr_matrix(dense)
+    return (
+        sparse.indptr.astype(np.int32),
+        sparse.indices.astype(np.int32),
+        sparse.data.astype(np.float64),
+        dense,
+    )
+
+
 # Builder and distinct (pattern_seed, right_hand_side_seed) pair per
 # supported matrix type, so every type gets its own reproducible random
 # system instead of all types sharing one draw.
@@ -170,6 +207,20 @@ def system(request):
     matrix_type = request.param
     indptr, indices, values, dense, right_hand_side = build_system(matrix_type)
     return matrix_type, indptr, indices, values, dense, right_hand_side
+
+
+@pytest.fixture
+def zero_diagonal_system():
+    """An (indptr, indices, values, dense, right_hand_side) system with zeros on the diagonal.
+
+    See zero_diagonal_saddle_point_csr for why this case is kept separate
+    from the diagonally dominant systems the `system` fixture builds.
+    """
+    indptr, indices, values, dense = zero_diagonal_saddle_point_csr(
+        dimension=32, density=0.3, seed=0
+    )
+    right_hand_side = np.random.default_rng(1).uniform(-1.0, 1.0, size=dense.shape[0])
+    return indptr, indices, values, dense, right_hand_side
 
 
 @pytest.fixture

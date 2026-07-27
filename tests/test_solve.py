@@ -55,6 +55,42 @@ def test_solve_transpose_matches_eager_under_jit(system):
     np.testing.assert_allclose(np.asarray(solution), expected, rtol=1e-8, atol=1e-10)
 
 
+def test_solve_matches_dense_reference_with_zeros_on_the_diagonal(zero_diagonal_system):
+    # A regression test for the iparm defaults, not for solve() itself. Half
+    # this matrix's diagonal entries are zero, so factoring it stably needs
+    # weighted matching (iparm[12]). With matching off, Pardiso perturbs the
+    # pivots and returns a badly wrong solution while still reporting
+    # success, so nothing but the numbers catches it.
+    indptr, indices, values, dense, right_hand_side = zero_diagonal_system
+    solution = pmj.solve(
+        jnp.asarray(indptr),
+        jnp.asarray(indices),
+        jnp.asarray(values),
+        jnp.asarray(right_hand_side),
+        matrix_type=pmj.MatrixType.REAL_NONSYMMETRIC,
+    )
+    expected = np.linalg.solve(dense, right_hand_side)
+    np.testing.assert_allclose(np.asarray(solution), expected, rtol=1e-8, atol=1e-10)
+
+
+def test_solve_residual_is_small_with_zeros_on_the_diagonal(zero_diagonal_system):
+    # The same regression stated as a residual bound rather than against a
+    # reference solution, since a perturbed factorization is wrong in
+    # exactly this way: it solves a nearby system, not the one given.
+    indptr, indices, values, dense, right_hand_side = zero_diagonal_system
+    solution = np.asarray(
+        pmj.solve(
+            jnp.asarray(indptr),
+            jnp.asarray(indices),
+            jnp.asarray(values),
+            jnp.asarray(right_hand_side),
+            matrix_type=pmj.MatrixType.REAL_NONSYMMETRIC,
+        )
+    )
+    residual = np.abs(dense @ solution - right_hand_side).max()
+    assert residual < 1e-10, f"residual {residual:.3e} suggests Pardiso perturbed its pivots"
+
+
 def test_solve_rejects_wrong_index_dtype(system):
     matrix_type, indptr, indices, values, _dense, right_hand_side = system
     with pytest.raises(TypeError, match="int32"):
