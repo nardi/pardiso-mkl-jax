@@ -233,39 +233,49 @@ the matrix types this package supports. This section documents and
 motivates each of them.
 
 `iparm[0]` is set to 1, meaning every other entry below is used exactly as
-given rather than left for Pardiso to fill in on its own. This is forced
-rather than optional, for a reason unrelated to the other settings: the MKL
-build this package links against has a bug where its own default for
-nonsymmetric matrices enables weighted matching (`iparm[12] = 1`), and that
-heuristic segfaults inside `mkl_pds_lp64_kuhn_munkres`, reproduced with a
-minimal standalone Pardiso call outside this package entirely, on ordinary,
-well-conditioned matrices, not just degenerate ones. Overriding `iparm[12]`
-back to 0 alone does not avoid the crash, since MKL resets it internally
-before the matching step runs whenever `iparm[0]` is left at 0. Taking over
-`iparm[0] = 1` is the only way to keep weighted matching disabled, which is
-why every other entry has to be specified explicitly too, even the ones
-that just restate what Pardiso's own default would have been.
+given rather than left for Pardiso to fill in on its own. That is what makes
+`iparm[34]` (zero-based indexing) and `iparm[11]` (transpose solves) reliable
+settings rather than ones Pardiso might overwrite. It also comes with a sharp
+edge worth stating plainly, because it caused a real bug: with `iparm[0] = 1`,
+every entry that is *not* assigned stays at 0, and 0 is not the same as "the
+default Pardiso would have picked". Any entry whose default is non-zero has to
+be restated explicitly, per matrix type, or it is silently switched off. The
+list below therefore reproduces `pardisoinit`'s defaults for every supported
+matrix type, with the two exceptions called out as such.
 
-- **`iparm[1] = 2`**, nested dissection (METIS-based) fill-reducing
-  ordering. This matches Pardiso's own default: it is restated here only
-  because `iparm[0] = 1` requires every entry to be given explicitly.
+- **`iparm[1] = 2`**, serial nested dissection (METIS-based) fill-reducing
+  ordering. This is the one entry chosen for its own sake rather than
+  copied from Pardiso, whose default is parallel nested dissection (3).
+  Serial ordering makes the factorization reproducible run to run
+  regardless of thread count.
+- **`iparm[7] = 2`**, maximum steps of iterative refinement, matching
+  Pardiso's own default for every matrix type. Refinement is the backstop
+  for a factorization that had to perturb a pivot: without it, a perturbed
+  solve returns whatever the perturbed factors give and never corrects it.
 - **`iparm[9]`**, the pivot perturbation exponent, is 13 for the
   nonsymmetric and structurally symmetric matrix types and 8 for the
-  symmetric and Hermitian ones. This also matches Pardiso's own default per
-  matrix type, restated for the same reason as `iparm[1]`.
+  symmetric and Hermitian ones, matching Pardiso's own default per matrix
+  type.
 - **`iparm[10]`**, maximum weighted matching's companion scaling step, is
-  enabled (1) only for `REAL_NONSYMMETRIC`, and disabled (0) otherwise,
-  again matching Pardiso's own default. Scaling itself is not affected by
-  the weighted matching bug described above, so there was no reason to
-  change it.
-- **`iparm[12] = 0`**, weighted matching, is disabled for every matrix
-  type. This is the one setting that is not just Pardiso's own default
-  restated: it is a deliberate departure, forced by the crash explained
-  above. The practical effect is a fixed row/column permutation and
-  scaling strategy for nonsymmetric matrices, rather than one adapted to
-  the specific values each time, which can mean somewhat more conservative
-  pivoting on badly scaled matrices than a working weighted matching would
-  give.
+  enabled (1) for the nonsymmetric matrix types and disabled (0)
+  otherwise, again matching Pardiso's own default.
+- **`iparm[12]`**, weighted matching, is enabled (1) for the nonsymmetric
+  matrix types and disabled (0) otherwise, matching Pardiso's own default.
+  Matching permutes large entries onto the diagonal before factoring, and
+  it is not optional in practice for any matrix with zeros on its diagonal
+  — saddle-point systems, KKT systems, and constraint blocks all qualify.
+  Without it, Pardiso finds tiny pivots there, perturbs them, and returns a
+  solution with a large residual while reporting success, so nothing but
+  the numbers themselves reveals the problem.
+- **`iparm[20]`**, Bunch-Kaufman 1x1 and 2x2 pivoting, is enabled (1) for
+  the symmetric indefinite matrix types and disabled (0) otherwise,
+  matching Pardiso's own default. Symmetric indefinite matrices need it for
+  the same reason nonsymmetric ones need matching: a zero diagonal entry
+  with no 2x2 pivot to fall back on gets perturbed instead.
+- **`iparm[17]` and `iparm[18]`** are left at 0 rather than Pardiso's
+  default of -1. This is the second deliberate departure: both only request
+  statistics (the number of non-zeros in the factors, and an MFLOP count)
+  that this package does not surface, and computing them is not free.
 - **`iparm[34] = 1`**, zero-based indexing. Pardiso defaults to one-based
   (Fortran-style) indexing. pardiso_mkl_jax works with zero-based CSR
   arrays throughout, matching NumPy, SciPy, and JAX, so leaving Pardiso's

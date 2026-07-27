@@ -25,6 +25,24 @@ def test_solve_matches_dense_reference(system):
     np.testing.assert_allclose(np.asarray(solution), expected, rtol=1e-8, atol=1e-10)
 
 
+def test_solve_matches_dense_reference_with_zeros_on_the_diagonal(zero_diagonal_system):
+    # The stateful counterpart to the same-named regression test in
+    # test_solve.py: analyze, factorize, and solve are separate native calls
+    # here, each re-initializing iparm, so this also pins that the matching
+    # setting survives being applied three times rather than once.
+    indptr, indices, values, dense, right_hand_side = zero_diagonal_system
+    with pmj.PardisoSolver(
+        jnp.asarray(indptr),
+        jnp.asarray(indices),
+        matrix_type=pmj.MatrixType.REAL_NONSYMMETRIC,
+    ) as solver:
+        solver.analyze(jnp.asarray(values))
+        solver.factorize(jnp.asarray(values))
+        solution = solver.solve(jnp.asarray(right_hand_side))
+    expected = np.linalg.solve(dense, right_hand_side)
+    np.testing.assert_allclose(np.asarray(solution), expected, rtol=1e-8, atol=1e-10)
+
+
 def test_solve_reused_across_many_right_hand_sides(system):
     matrix_type, indptr, indices, values, dense, _right_hand_side = system
     random_state = np.random.default_rng(42)
