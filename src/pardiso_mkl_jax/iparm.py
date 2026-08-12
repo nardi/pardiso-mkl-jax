@@ -264,6 +264,19 @@ def canonicalize_overlay(options: OptionsLike) -> tuple[tuple[int, int], ...]:
     return tuple(sorted(canonical.items()))
 
 
+def merge_overlays(base: OptionsLike, override: OptionsLike) -> tuple[tuple[int, int], ...]:
+    """Combine two iparm overlays, with override winning on any index both set.
+
+    Used for PardisoSolver's solver-wide options, which every call layers its
+    own per-call options on top of. Both sides go through
+    canonicalize_overlay, so an invalid entry is rejected the same way here as
+    anywhere else and the result is canonical in its own right.
+    """
+    merged = dict(canonicalize_overlay(base))
+    merged.update(canonicalize_overlay(override))
+    return tuple(sorted(merged.items()))
+
+
 @functools.cache
 def overlay_to_arrays(canonical: tuple[tuple[int, int], ...]) -> tuple[np.ndarray, np.ndarray]:
     """Expand a canonical overlay into the (mask, values) int32[64] pair the FFI call expects.

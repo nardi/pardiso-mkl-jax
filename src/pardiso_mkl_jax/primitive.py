@@ -1,8 +1,8 @@
 """Low-level JAX bindings for the compiled Pardiso FFI targets.
 
 Wraps each XLA custom call target registered by _ffi.pyx as a plain JAX
-function. `analyze`, `factor`, `solve_stateful`, and `release` operate on a
-persistent native factorization identified by a handle, an ordinary int64
+function. `analyze`, `reanalyze`, `factor`, `solve_stateful`, and `release`
+operate on a persistent native factorization identified by a handle, an int64
 JAX array value returned by `analyze` and threaded through every later call,
 and back the PardisoSolver class in solver.py. Because the handle is a JAX
 value rather than a Python-side id baked in at trace time, XLA orders
@@ -33,7 +33,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from pardiso_mkl_jax import _ffi  # noqa: F401  (import registers the FFI targets)
+from pardiso_mkl_jax import _ffi  # importing also registers the FFI targets
 from pardiso_mkl_jax.iparm import (
     OptionsLike,
     PardisoDiagnostics,
@@ -57,6 +57,23 @@ TRANSPOSE_TRANSPOSE = 2
 
 def _transpose_mode(transpose: bool) -> np.int64:
     return np.int64(TRANSPOSE_TRANSPOSE if transpose else TRANSPOSE_NONE)
+
+
+@functools.cache
+def default_iparm(matrix_type: MatrixType) -> np.ndarray:
+    """This package's iparm defaults for matrix_type, before any overlay is applied.
+
+    Read out of InitializeIparm in _pardiso_ffi.cc rather than restated here,
+    so there is only ever one copy of those defaults. Callers need this to
+    work out the value an entry will actually take for a call, which is the
+    overlay entry if the overlay has one and this default otherwise.
+
+    The returned array is cached and shared, so it is made read-only to stop a
+    caller mutating every later reader's copy.
+    """
+    defaults = _ffi.default_iparm(int(matrix_type))
+    defaults.flags.writeable = False
+    return defaults
 
 
 def _overlay_buffers(options: OptionsLike) -> tuple[jax.Array, jax.Array]:
@@ -83,6 +100,10 @@ def analyze(indptr, indices, values, *, matrix_type: MatrixType, options: Option
     analyze-factor-solve-release lifecycle and lets it run inside a jitted
     function. final_iparm is the complete iparm array as Pardiso left it, for
     decoding into a PardisoDiagnostics.
+
+    Every call allocates a new factorization. To redo the analysis for a
+    handle that already has one, use reanalyze instead, which reuses the
+    handle rather than leaving the old one for the caller to release.
     """
     dimension = indptr.shape[0] - 1
     overlay_mask, overlay_values = _overlay_buffers(options)
@@ -104,6 +125,45 @@ def analyze(indptr, indices, values, *, matrix_type: MatrixType, options: Option
         dimension=np.int64(dimension),
     )
     return handle, final_iparm
+
+
+def reanalyze(
+    handle, indptr, indices, values, *, matrix_type: MatrixType, options: OptionsLike = None
+):
+    """Re-run the analyze (phase 11) step in place on an existing handle.
+
+    Frees the factorization currently held for handle and runs a fresh
+    symbolic analysis into the same native state, so this is how a caller
+    redoes the analysis (for a new sparsity-compatible pattern, different
+    values, or a different overlay) without ending up holding two handles.
+    Returns (handle, final_iparm) with the handle unchanged, which keeps later
+    calls ordered against it by data dependency exactly as factor does.
+
+    The numeric factorization is gone afterwards, so factor must run again
+    before any solve. Raises if handle was never analyzed or has been
+    released.
+    """
+    dimension = indptr.shape[0] - 1
+    overlay_mask, overlay_values = _overlay_buffers(options)
+    handle_out, _status, final_iparm = jax.ffi.ffi_call(
+        "pardiso_mkl_jax_reanalyze",
+        (
+            jax.ShapeDtypeStruct((), jnp.int64),
+            jax.ShapeDtypeStruct((), jnp.int32),
+            jax.ShapeDtypeStruct((64,), jnp.int32),
+        ),
+        has_side_effect=True,
+    )(
+        handle,
+        indptr,
+        indices,
+        values,
+        overlay_mask,
+        overlay_values,
+        matrix_type=np.int64(matrix_type),
+        dimension=np.int64(dimension),
+    )
+    return handle_out, final_iparm
 
 
 def factor(
