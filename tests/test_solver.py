@@ -256,6 +256,170 @@ def test_many_create_close_cycles_do_not_leak(system):
         np.testing.assert_allclose(np.asarray(solution), expected, rtol=1e-8, atol=1e-10)
 
 
+def handle_value(solver) -> int:
+    """The solver's native handle as a plain int, for comparing across calls."""
+    assert solver._handle is not None
+    return int(solver._handle)
+
+
+def test_analyze_again_reanalyzes_in_place(system):
+    """A second analyze() reuses the handle instead of allocating another one.
+
+    The point of re-analysis: a caller recovering from a bad factorization can
+    redo the symbolic phase without ending up holding two handles and having
+    to free the old one conditionally.
+    """
+    matrix_type, indptr, indices, values, dense, right_hand_side = system
+    with pmj.PardisoSolver(
+        jnp.asarray(indptr), jnp.asarray(indices), matrix_type=matrix_type
+    ) as solver:
+        solver.analyze(jnp.asarray(values))
+        first_handle = handle_value(solver)
+        assert _ffi.analysis_count(first_handle) == 1
+
+        new_values = values * 2.0
+        solver.analyze(jnp.asarray(new_values))
+        assert handle_value(solver) == first_handle
+        assert _ffi.analysis_count(first_handle) == 2
+
+        solver.factorize(jnp.asarray(new_values))
+        solution = solver.solve(jnp.asarray(right_hand_side))
+
+    expected = np.linalg.solve(dense * 2.0, right_hand_side)
+    np.testing.assert_allclose(np.asarray(solution), expected, rtol=1e-8, atol=1e-10)
+
+
+def test_reanalysis_discards_the_factorization(any_system):
+    """Re-analysis frees the factors, so solve() is back to needing a factorize()."""
+    indptr, indices, values, _dense, right_hand_side = any_system
+    with pmj.PardisoSolver(
+        jnp.asarray(indptr), jnp.asarray(indices), matrix_type=pmj.MatrixType.REAL_NONSYMMETRIC
+    ) as solver:
+        solver.analyze(jnp.asarray(values))
+        solver.factorize(jnp.asarray(values))
+        solver.solve(jnp.asarray(right_hand_side))
+
+        solver.analyze(jnp.asarray(values))
+        with pytest.raises(RuntimeError, match="factorize"):
+            solver.solve(jnp.asarray(right_hand_side))
+        # refactorize() has the same precondition, and re-analysis clears it.
+        with pytest.raises(RuntimeError, match="factorize"):
+            solver.refactorize(jnp.asarray(values))
+
+        solver.factorize(jnp.asarray(values))
+        solver.solve(jnp.asarray(right_hand_side))
+
+
+def test_repeated_reanalysis_does_not_leak(any_system):
+    """Twenty re-analyses on one solver stay on one handle and keep solving correctly."""
+    indptr, indices, values, dense, right_hand_side = any_system
+    expected = np.linalg.solve(dense, right_hand_side)
+    with pmj.PardisoSolver(
+        jnp.asarray(indptr), jnp.asarray(indices), matrix_type=pmj.MatrixType.REAL_NONSYMMETRIC
+    ) as solver:
+        solver.analyze(jnp.asarray(values))
+        handle = handle_value(solver)
+        for _ in range(20):
+            solver.analyze(jnp.asarray(values))
+            solver.factorize(jnp.asarray(values))
+            solution = solver.solve(jnp.asarray(right_hand_side))
+            np.testing.assert_allclose(np.asarray(solution), expected, rtol=1e-8, atol=1e-10)
+        assert handle_value(solver) == handle
+        assert _ffi.analysis_count(handle) == 21
+
+
+def test_reanalyze_primitive_inside_and_outside_jit(system):
+    """The re-analysis is ordered correctly inside a trace and agrees with eager.
+
+    The handle goes into reanalyze and comes back out, which is what gives XLA
+    a data dependency to order it against the factor and solve around it.
+    """
+    matrix_type, indptr, indices, values, dense, right_hand_side = system
+    indptr = jnp.asarray(indptr)
+    indices = jnp.asarray(indices)
+
+    def run(first_values, second_values, right_hand_side):
+        handle, _iparm = primitive.analyze(indptr, indices, first_values, matrix_type=matrix_type)
+        handle, _iparm = primitive.factor(
+            handle, indptr, indices, first_values, matrix_type=matrix_type
+        )
+        handle, _iparm = primitive.reanalyze(
+            handle, indptr, indices, second_values, matrix_type=matrix_type
+        )
+        handle, _iparm = primitive.factor(
+            handle, indptr, indices, second_values, matrix_type=matrix_type
+        )
+        solution, _iparm = primitive.solve_stateful(
+            handle,
+            indptr,
+            indices,
+            second_values,
+            right_hand_side[None, :],
+            matrix_type=matrix_type,
+        )
+        return solution[0], handle
+
+    arguments = (jnp.asarray(values), jnp.asarray(values * 2.0), jnp.asarray(right_hand_side))
+    traced, traced_handle = jax.jit(run)(*arguments)
+    eager, eager_handle = run(*arguments)
+
+    # Two analyses ran on each handle, so the re-analysis was neither dropped
+    # nor reordered ahead of the analyze that created the entry.
+    assert _ffi.analysis_count(traced_handle) == 2
+    assert _ffi.analysis_count(eager_handle) == 2
+    primitive.release(traced_handle)
+    primitive.release(eager_handle)
+
+    expected = np.linalg.solve(dense * 2.0, right_hand_side)
+    np.testing.assert_allclose(np.asarray(traced), expected, rtol=1e-8, atol=1e-10)
+    np.testing.assert_allclose(np.asarray(eager), expected, rtol=1e-8, atol=1e-10)
+    np.testing.assert_allclose(np.asarray(traced), np.asarray(eager), rtol=1e-12, atol=1e-14)
+
+
+def test_reanalyze_rejects_an_unknown_handle(any_system):
+    indptr, indices, values, _dense, _right_hand_side = any_system
+    indptr = jnp.asarray(indptr)
+    indices = jnp.asarray(indices)
+    values = jnp.asarray(values)
+    matrix_type = pmj.MatrixType.REAL_NONSYMMETRIC
+
+    handle, _iparm = primitive.analyze(indptr, indices, values, matrix_type=matrix_type)
+    primitive.release(handle)
+    with pytest.raises(Exception, match="unknown handle"):
+        primitive.reanalyze(handle, indptr, indices, values, matrix_type=matrix_type)
+
+
+def test_a_failed_reanalysis_leaves_the_solver_unusable(any_system):
+    """A re-analysis that fails reports no analysis, rather than the state it had going in.
+
+    Re-analysis frees the existing factorization before doing anything else,
+    so once it has failed there is nothing left to fall back on. Provoked here
+    by releasing the handle behind the solver's back, which is the one way to
+    make the native call fail on demand.
+    """
+    indptr, indices, values, _dense, right_hand_side = any_system
+    with pmj.PardisoSolver(
+        jnp.asarray(indptr), jnp.asarray(indices), matrix_type=pmj.MatrixType.REAL_NONSYMMETRIC
+    ) as solver:
+        solver.analyze(jnp.asarray(values))
+        solver.factorize(jnp.asarray(values))
+        primitive.release(solver._handle)
+
+        with pytest.raises(Exception, match="unknown handle"):
+            solver.analyze(jnp.asarray(values))
+
+        with pytest.raises(RuntimeError, match="analyze"):
+            solver.factorize(jnp.asarray(values))
+        with pytest.raises(RuntimeError, match="factorize"):
+            solver.solve(jnp.asarray(right_hand_side))
+        with pytest.raises(RuntimeError, match="analyze"):
+            solver.refactor_and_solve(jnp.asarray(values), jnp.asarray(right_hand_side))
+
+        # close() would otherwise release a handle that is already gone. That
+        # is harmless natively, but there is no reason to make the test do it.
+        solver._handle = None
+
+
 # The lifecycle and precondition checks below (context manager enforcement,
 # method ordering, idempotent close) do not depend on the matrix type: they
 # are raised before Pardiso ever sees the values, so they run once against
