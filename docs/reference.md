@@ -28,6 +28,8 @@ want to manage a factorization's handle explicitly. See
 
 ::: pardiso_mkl_jax.primitive.analyze
 
+::: pardiso_mkl_jax.primitive.reanalyze
+
 ::: pardiso_mkl_jax.primitive.factor
 
 ::: pardiso_mkl_jax.primitive.solve_stateful
@@ -35,3 +37,5 @@ want to manage a factorization's handle explicitly. See
 ::: pardiso_mkl_jax.primitive.factor_and_solve_stateful
 
 ::: pardiso_mkl_jax.primitive.release
+
+::: pardiso_mkl_jax.primitive.default_iparm

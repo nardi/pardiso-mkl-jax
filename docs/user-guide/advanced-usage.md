@@ -8,7 +8,9 @@ into separate calls, so you control exactly what work happens on each one:
 
 - `analyze(values)` runs the symbolic analysis (fill-reducing ordering) for
   the sparsity pattern. This is the expensive step you want to avoid
-  repeating, and needs to run only once per pattern.
+  repeating, and needs to run only once per pattern. Calling it again
+  re-analyzes in place, see [Re-analyzing in place](#re-analyzing-in-place)
+  below.
 - `factorize(values)` runs the first numeric factorization, and requires a
   prior `analyze()`.
 - `refactorize(values)` updates the numeric factorization for new values on
@@ -54,6 +56,57 @@ with pmj.PardisoSolver(
     solver.refactorize(values * 2.0)
     third = solver.solve(jnp.array([1.0, 2.0, 3.0], dtype=jnp.float64))
 ```
+
+## Re-analyzing in place
+
+Calling `analyze()` a second time on the same solver redoes the symbolic
+phase on the handle the solver already holds. The existing factorization is
+freed first, and no second handle is allocated, so there is nothing extra to
+release. This is the recovery path for a factorization that came back
+unusable: re-analyze with different settings and try again, without having to
+build a second solver and free the first one conditionally.
+
+Because the re-analysis discards the factorization, `factorize()` has to run
+again before the next `solve()`. Calling `solve()` or `refactorize()` in
+between raises, rather than solving against memory that is no longer there.
+
+```python
+import jax
+
+jax.config.update("jax_enable_x64", True)
+
+import jax.numpy as jnp
+import pardiso_mkl_jax as pmj
+from pardiso_mkl_jax import PardisoOption
+
+indptr = jnp.array([0, 2, 3, 4], dtype=jnp.int32)
+indices = jnp.array([0, 1, 1, 2], dtype=jnp.int32)
+values = jnp.array([4.0, 1.0, 3.0, 2.0], dtype=jnp.float64)
+right_hand_side = jnp.array([1.0, 2.0, 3.0], dtype=jnp.float64)
+
+with pmj.PardisoSolver(
+    indptr, indices, matrix_type=pmj.MatrixType.REAL_NONSYMMETRIC
+) as solver:
+    solver.analyze(values)
+    diagnostics = solver.factorize(values, return_diagnostics=True)
+
+    if diagnostics.perturbed_pivot_count > 0:
+        # Pardiso could not pivot cleanly. Re-analyze on the same handle with
+        # matching disabled, then factorize again.
+        solver.analyze(values, options={PardisoOption.WEIGHTED_MATCHING: 0})
+        solver.factorize(values, options={PardisoOption.WEIGHTED_MATCHING: 0})
+
+    solution = solver.solve(right_hand_side)
+```
+
+`analyze()` must be called outside `jax.jit`, both the first time and for a
+re-analysis: it stores the native handle on the solver, and under jit that
+handle is a tracer, which would escape its trace. To re-analyze inside a
+traced function, use [`primitive.reanalyze`][pardiso_mkl_jax.primitive] and
+thread the handle yourself, as in
+[Building on the low-level primitives](#building-on-the-low-level-primitives)
+below. That works under jit: the handle goes in and comes back out, so XLA
+orders the re-analysis against the calls around it by data dependency.
 
 ## Composing inside jax.jit
 
@@ -103,9 +156,10 @@ the results, for example with `jax.lax.optimization_barrier`..
 
 `PardisoSolver` itself is built on the functions in
 [`pardiso_mkl_jax.primitive`][pardiso_mkl_jax.primitive]: `analyze`,
-`factor`, `solve_stateful`, `factor_and_solve_stateful`, and `release`. Each
-one threads a handle value in and, except for `solve_stateful`, back out
-again. Library authors who want to manage a factorization's lifetime
+`reanalyze`, `factor`, `solve_stateful`, `factor_and_solve_stateful`, and
+`release`. Each one threads a handle value in and, except for
+`solve_stateful`, back out again. Library authors who want to manage a
+factorization's lifetime
 explicitly, rather than through `PardisoSolver`'s own context manager, for
 example tying it to a scope object or to another jit-traced dependency, can
 call these functions directly:
@@ -329,11 +383,52 @@ with pmj.PardisoSolver(
     x = solver.solve(right_hand_side)
 ```
 
-An overlay entry does not persist beyond the call it was passed to.
-`PardisoSolver`'s defaults are recomputed fresh on every `analyze`,
-`factorize`, or `refactorize` call, so an overlay entry passed to `analyze`
-does not automatically apply to a later `factorize` or `refactorize` on the
-same solver: pass it again wherever it needs to apply.
+An overlay passed to a single method does not persist beyond that call.
+Pardiso's parameters are recomputed fresh on every native call, so an entry
+passed to `analyze` does not carry over to a later `factorize` or
+`refactorize` on the same solver.
+
+To set an overlay for a solver's whole lifetime, pass it to the constructor
+instead. It is applied to every call, and a per-call `options` argument
+layers on top of it, winning on any entry both set:
+
+```python
+import jax
+
+jax.config.update("jax_enable_x64", True)
+
+import jax.numpy as jnp
+import pardiso_mkl_jax as pmj
+from pardiso_mkl_jax import PardisoOption
+
+indptr = jnp.array([0, 2, 3, 4], dtype=jnp.int32)
+indices = jnp.array([0, 1, 1, 2], dtype=jnp.int32)
+values = jnp.array([4.0, 1.0, 3.0, 2.0], dtype=jnp.float64)
+right_hand_side = jnp.array([1.0, 2.0, 3.0], dtype=jnp.float64)
+
+# Matching and scaling both look at the numeric values during analysis.
+# Turning them off keeps the analysis independent of the values, so one
+# handle stays valid across matrices that are scaled differently.
+with pmj.PardisoSolver(
+    indptr,
+    indices,
+    matrix_type=pmj.MatrixType.REAL_NONSYMMETRIC,
+    options={PardisoOption.WEIGHTED_MATCHING: 0, PardisoOption.SCALING: 0},
+) as solver:
+    solver.analyze(values)
+    solver.factorize(values * 1e6)
+    solution = solver.solve(right_hand_side)
+```
+
+`SCALING` and `WEIGHTED_MATCHING` are the two entries where getting this
+wrong is a correctness problem rather than an inconvenience. Pardiso computes
+both during analysis and expects them unchanged at every later phase, and
+nothing in the native layer enforces that: a disagreement is silently
+accepted and gives a wrong answer instead of an error. `PardisoSolver` checks
+for it and raises a `ValueError` naming the option, so setting either of
+these on `analyze` alone is rejected rather than quietly mishandled. Set them
+on the constructor so they apply everywhere, or pass the same value to every
+call.
 
 Most `iparm` entries can be overridden freely. A few are handled specially:
 
@@ -371,10 +466,12 @@ counts for symmetric indefinite matrices, and more. `solve` and every
 `PardisoSolver` method surface these through
 [`PardisoDiagnostics`][pardiso_mkl_jax.PardisoDiagnostics].
 
-Pass `return_diagnostics=True` to `solve` to get `(solution, diagnostics)`
-back instead of just the solution. `PardisoSolver` records diagnostics from
-`analyze`, `factorize`, `refactorize`, and `solve` automatically, readable
-from `last_diagnostics`:
+Every method takes a `return_diagnostics=True` flag. `solve` and
+`refactor_and_solve` return `(solution, diagnostics)` with it set, and
+`analyze`, `factorize`, and `refactorize` return the diagnostics directly
+where they otherwise return nothing. `PardisoSolver` also records diagnostics
+from `analyze`, `factorize`, `refactorize`, and `solve` automatically,
+readable from `last_diagnostics`:
 
 ```python
 import jax
@@ -404,14 +501,34 @@ negative_eigenvalues = diagnostics.negative_eigenvalues
 Fields not given a name are still reachable through `diagnostics.raw`, the
 full 64-entry `iparm` array Pardiso left behind.
 
-`refactor_and_solve` is the one method that does not update
-`last_diagnostics`. It is meant to be callable from inside a jitted function,
-where storing anything derived from its results would leave a tracer on the
-solver, so it takes the same `return_diagnostics=True` flag as `solve` and
-returns `(solution, diagnostics)` instead.
+### Perturbed pivots
 
-Diagnostics work under `jit`, including when `solve` itself is wrapped
-directly, and under `vmap`. Under the default `vmap` batching (batching over
+`perturbed_pivot_count` is Pardiso's own report that it could not pivot
+cleanly during a numeric factorization: it replaced pivots that were too
+small with a perturbation and carried on. A non-zero count means the
+factorization may not be usable, and Pardiso signals this here rather than
+through an error code, so a caller that does not check it gets a solution
+with a large residual and no indication anything went wrong.
+
+The count is only meaningful after a call that actually factorized:
+`factorize`, `refactorize`, `refactor_and_solve`, or the functional `solve`.
+After `analyze` or a `PardisoSolver.solve` it reports whatever the last
+factorization left behind. See
+[Re-analyzing in place](#re-analyzing-in-place) for the recovery path.
+
+### Diagnostics under jit and vmap
+
+`last_diagnostics` is `None` after a call that ran under `jax.jit`. The
+diagnostics only exist as tracers there, and storing one on the solver would
+leak it out of its trace, so reading it back afterwards would raise rather
+than return anything usable. Use `return_diagnostics=True` for traced calls,
+which returns the diagnostics as ordinary jit outputs.
+
+`refactor_and_solve` never updates `last_diagnostics`, traced or not: keeping
+nothing at all on the solver is the point of that method. It takes the same
+`return_diagnostics=True` flag.
+
+Diagnostics work under `vmap` as well. Under the default `vmap` batching (batching over
 `values`, or over both `values` and the right-hand side), each batch element
 gets its own diagnostics, since each one was genuinely factorized separately.
 Batching only over the right-hand side reuses a single native call for the
