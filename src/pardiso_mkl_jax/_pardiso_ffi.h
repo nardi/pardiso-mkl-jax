@@ -6,12 +6,20 @@
 #ifndef PARDISO_MKL_JAX_FFI_H_
 #define PARDISO_MKL_JAX_FFI_H_
 
+#include <cstdint>
+
 extern "C" {
 
 // Stateful handler for the analyze step (phase 11). Allocates a fresh
 // registry entry and returns its key as an int64 handle value, which every
 // later stage threads through as ordinary data.
 void* pardiso_analyze_handler_address();
+
+// Stateful handler that re-runs the analyze step (phase 11) in place on a
+// handle an earlier analyze already allocated, freeing the existing
+// factorization first. Returns the same handle, so no second registry entry
+// is created and nothing extra needs freeing.
+void* pardiso_reanalyze_handler_address();
 
 // Stateful handler for the numeric factorization step (phase 22). Takes the
 // handle returned by analyze and passes it through unchanged, so a
@@ -35,6 +43,11 @@ void* pardiso_release_handler_address();
 // and solve (combined phase 13) with a local handle that is released again
 // before the call returns, so it never touches the registry.
 void* pardiso_solve_once_handler_address();
+
+// Writes this package's 64 iparm defaults for a matrix type into out. Lets
+// the Python side work out what value an entry will take for a call without
+// keeping its own copy of those defaults.
+void pardiso_default_iparm(long matrix_type, int32_t* out);
 
 // Read and reset the analysis call counter for a handle. Used by tests to
 // assert that a reused factorization does not re-run the symbolic phase.

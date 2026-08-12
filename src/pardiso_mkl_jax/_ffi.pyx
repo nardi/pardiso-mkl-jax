@@ -10,15 +10,20 @@ used by the test suite.
 """
 
 from cpython.pycapsule cimport PyCapsule_New
+from libc.stdint cimport int32_t
+
+import numpy as np
 
 
 cdef extern from "_pardiso_ffi.h":
     void* pardiso_analyze_handler_address()
+    void* pardiso_reanalyze_handler_address()
     void* pardiso_factor_handler_address()
     void* pardiso_solve_handler_address()
     void* pardiso_factor_solve_handler_address()
     void* pardiso_release_handler_address()
     void* pardiso_solve_once_handler_address()
+    void pardiso_default_iparm(long matrix_type, int32_t* out)
     long pardiso_analysis_count(long handle)
     void pardiso_reset_analysis_count(long handle)
 
@@ -34,6 +39,9 @@ def _register_targets():
 
     jax.ffi.register_ffi_target(
         "pardiso_mkl_jax_analyze", _capsule(pardiso_analyze_handler_address()), platform="cpu"
+    )
+    jax.ffi.register_ffi_target(
+        "pardiso_mkl_jax_reanalyze", _capsule(pardiso_reanalyze_handler_address()), platform="cpu"
     )
     jax.ffi.register_ffi_target(
         "pardiso_mkl_jax_factor", _capsule(pardiso_factor_handler_address()), platform="cpu"
@@ -57,6 +65,18 @@ def _register_targets():
 
 
 _register_targets()
+
+
+def default_iparm(matrix_type):
+    """This package's 64 iparm defaults for matrix_type, as an int32 numpy array.
+
+    Read straight out of InitializeIparm in _pardiso_ffi.cc, so the Python
+    side never has to restate those defaults. See primitive.default_iparm for
+    the cached wrapper callers should use.
+    """
+    cdef int32_t[::1] out = np.zeros(64, dtype=np.int32)
+    pardiso_default_iparm(int(matrix_type), &out[0])
+    return np.asarray(out)
 
 
 def analysis_count(handle):

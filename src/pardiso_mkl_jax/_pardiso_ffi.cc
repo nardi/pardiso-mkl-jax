@@ -157,6 +157,19 @@ void ApplyOverlay(MKL_INT* iparm, const int32_t* overlay_mask, const int32_t* ov
 
 }  // namespace
 
+// Hands this package's iparm defaults for a matrix type to the Python side,
+// so nothing there has to keep a second copy of InitializeIparm in sync.
+// solver.py needs them to work out the value an entry will actually take for
+// a call, which is the overlay entry if there is one and this default
+// otherwise.
+extern "C" void pardiso_default_iparm(long matrix_type, int32_t* out) {
+  MKL_INT iparm[64] = {};
+  InitializeIparm(iparm, static_cast<MKL_INT>(matrix_type));
+  for (int i = 0; i < 64; ++i) {
+    out[i] = static_cast<int32_t>(iparm[i]);
+  }
+}
+
 extern "C" long pardiso_analysis_count(long handle) {
   std::lock_guard<std::mutex> lock(RegistryMutex());
   auto iterator = Registry().find(handle);
@@ -212,6 +225,90 @@ ffi::Error PardisoAnalyzeImpl(int64_t matrix_type, int64_t dimension,
   status->typed_data()[0] = static_cast<int32_t>(error);
   if (error != 0) {
     return ffi::Error::Internal(PardisoErrorMessage("analyze", error));
+  }
+  return ffi::Error::Success();
+}
+
+// Re-analyze (phase 11) in place, against the state an earlier analyze
+// already allocated for this handle. Frees the existing factorization first,
+// then runs a fresh symbolic phase into the same registry entry, so the
+// handle value never changes and later calls stay ordered against it by data
+// dependency. That is the point of this handler: re-analyzing through the
+// plain analyze handler would mint a second handle the caller then has to
+// free separately.
+//
+// The free and the re-analysis happen under a single lock hold, so the entry
+// is never observable in the half-freed state between them.
+ffi::Error PardisoReanalyzeImpl(int64_t matrix_type, int64_t dimension,
+                                 ffi::Buffer<ffi::S64> handle_in, ffi::Buffer<ffi::S32> indptr,
+                                 ffi::Buffer<ffi::S32> indices, ffi::Buffer<ffi::F64> values,
+                                 ffi::Buffer<ffi::S32> options_mask,
+                                 ffi::Buffer<ffi::S32> options_values,
+                                 ffi::ResultBuffer<ffi::S64> handle_out,
+                                 ffi::ResultBuffer<ffi::S32> status,
+                                 ffi::ResultBuffer<ffi::S32> final_iparm) {
+  int64_t handle = handle_in.typed_data()[0];
+
+  // Every early return below still fills the result buffers. Returning an
+  // error makes JAX raise rather than read them, but XLA allocated them
+  // uninitialized and leaving them that way is a trap for anyone who later
+  // makes a failure path non-fatal.
+  handle_out->typed_data()[0] = handle;
+  std::memset(final_iparm->typed_data(), 0, sizeof(int32_t) * 64);
+
+  std::lock_guard<std::mutex> lock(RegistryMutex());
+  auto iterator = Registry().find(handle);
+  if (iterator == Registry().end()) {
+    // Unlike release, where a missing handle just means "already gone", there
+    // is nothing sensible to re-analyze here: the caller is working from a
+    // handle that was never allocated or has been freed.
+    status->typed_data()[0] = -1;
+    return ffi::Error::Internal("pardiso reanalyze called with an unknown handle " +
+                                std::to_string(handle));
+  }
+  PardisoState& state = iterator->second;
+
+  MKL_INT maxfct = 1;
+  MKL_INT mnum = 1;
+  MKL_INT number_of_right_hand_sides = 0;
+  MKL_INT message_level = 0;
+
+  // Release against the stored matrix type and dimension, which are what the
+  // existing factorization was actually allocated for. The call attributes
+  // describe the *new* analysis and only take effect below.
+  MKL_INT release_phase = -1;
+  MKL_INT release_error = 0;
+  pardiso(state.handle, &maxfct, &mnum, &state.matrix_type, &release_phase, &state.dimension,
+          /*a=*/nullptr, /*ia=*/nullptr, /*ja=*/nullptr, /*perm=*/nullptr,
+          &number_of_right_hand_sides, state.iparm, &message_level, /*b=*/nullptr, /*x=*/nullptr,
+          &release_error);
+  if (release_error != 0) {
+    status->typed_data()[0] = static_cast<int32_t>(release_error);
+    return ffi::Error::Internal(PardisoErrorMessage("reanalyze release", release_error));
+  }
+
+  // Pardiso expects a zeroed pt going into a fresh phase 11. The release
+  // above frees what pt pointed at but does not clear the array itself.
+  std::memset(state.handle, 0, sizeof(state.handle));
+  state.matrix_type = static_cast<MKL_INT>(matrix_type);
+  state.dimension = static_cast<MKL_INT>(dimension);
+  InitializeIparm(state.iparm, state.matrix_type);
+  ApplyOverlay(state.iparm, options_mask.typed_data(), options_values.typed_data());
+
+  MKL_INT phase_value = 11;
+  MKL_INT error = 0;
+
+  pardiso(state.handle, &maxfct, &mnum, &state.matrix_type, &phase_value, &state.dimension,
+          const_cast<double*>(values.typed_data()), AsMklInt(indptr.typed_data()),
+          AsMklInt(indices.typed_data()), /*perm=*/nullptr, &number_of_right_hand_sides,
+          state.iparm, &message_level, /*b=*/nullptr, /*x=*/nullptr, &error);
+
+  state.analysis_count += 1;
+  handle_out->typed_data()[0] = handle;
+  std::memcpy(final_iparm->typed_data(), state.iparm, sizeof(MKL_INT) * 64);
+  status->typed_data()[0] = static_cast<int32_t>(error);
+  if (error != 0) {
+    return ffi::Error::Internal(PardisoErrorMessage("reanalyze", error));
   }
   return ffi::Error::Success();
 }
@@ -453,6 +550,21 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(kPardisoAnalyzeHandler, PardisoAnalyzeImpl,
                                    .Ret<ffi::Buffer<ffi::S32>>()  // final_iparm
 );
 
+XLA_FFI_DEFINE_HANDLER_SYMBOL(kPardisoReanalyzeHandler, PardisoReanalyzeImpl,
+                               ffi::Ffi::Bind()
+                                   .Attr<int64_t>("matrix_type")
+                                   .Attr<int64_t>("dimension")
+                                   .Arg<ffi::Buffer<ffi::S64>>()  // handle
+                                   .Arg<ffi::Buffer<ffi::S32>>()  // indptr
+                                   .Arg<ffi::Buffer<ffi::S32>>()  // indices
+                                   .Arg<ffi::Buffer<ffi::F64>>()  // values
+                                   .Arg<ffi::Buffer<ffi::S32>>()  // options_mask
+                                   .Arg<ffi::Buffer<ffi::S32>>()  // options_values
+                                   .Ret<ffi::Buffer<ffi::S64>>()  // handle
+                                   .Ret<ffi::Buffer<ffi::S32>>()  // status
+                                   .Ret<ffi::Buffer<ffi::S32>>()  // final_iparm
+);
+
 XLA_FFI_DEFINE_HANDLER_SYMBOL(kPardisoFactorHandler, PardisoFactorImpl,
                                ffi::Ffi::Bind()
                                    .Attr<int64_t>("matrix_type")
@@ -530,6 +642,10 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(kPardisoSolveOnceHandler, PardisoSolveOnceImpl,
 
 extern "C" void* pardiso_analyze_handler_address() {
   return reinterpret_cast<void*>(pardiso_mkl_jax::kPardisoAnalyzeHandler);
+}
+
+extern "C" void* pardiso_reanalyze_handler_address() {
+  return reinterpret_cast<void*>(pardiso_mkl_jax::kPardisoReanalyzeHandler);
 }
 
 extern "C" void* pardiso_factor_handler_address() {
