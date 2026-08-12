@@ -248,20 +248,37 @@ def test_diagnostics_under_vmap_values_batched(system):
     assert diagnostics.raw.shape[0] == 3
 
 
-def test_last_diagnostics_under_jit():
+def test_last_diagnostics_is_none_after_a_jitted_call():
+    """A traced call leaves last_diagnostics unset, and return_diagnostics still works.
+
+    Under jit the diagnostics only exist as tracers. Storing one would leak it
+    out of its trace, so reading it back later would raise instead of
+    returning anything usable.
+    """
     from conftest import build_system
 
     matrix_type = pmj.MatrixType.REAL_NONSYMMETRIC
     indptr, indices, values, dense, right_hand_side = build_system(matrix_type)
+    expected = np.linalg.solve(dense, right_hand_side)
 
     with pmj.PardisoSolver(
         jnp.asarray(indptr), jnp.asarray(indices), matrix_type=matrix_type
     ) as solver:
         solver.analyze(jnp.asarray(values))
-        solver.factorize(jnp.asarray(values))
+        eager_diagnostics = solver.factorize(jnp.asarray(values), return_diagnostics=True)
+        assert solver.last_diagnostics is not None
 
         jit_solve = jax.jit(solver.solve)
         solution = jit_solve(jnp.asarray(right_hand_side))
-        expected = np.linalg.solve(dense, right_hand_side)
         np.testing.assert_allclose(np.asarray(solution), expected, rtol=1e-8, atol=1e-10)
-        assert solver.last_diagnostics is not None
+        assert solver.last_diagnostics is None
+
+        # The returned form is the one that survives tracing, and it agrees
+        # with what the same call reports eagerly.
+        jit_solve_with_diagnostics = jax.jit(lambda rhs: solver.solve(rhs, return_diagnostics=True))
+        solution, diagnostics = jit_solve_with_diagnostics(jnp.asarray(right_hand_side))
+        np.testing.assert_allclose(np.asarray(solution), expected, rtol=1e-8, atol=1e-10)
+        assert int(diagnostics.perturbed_pivot_count) == int(
+            eager_diagnostics.perturbed_pivot_count
+        )
+        assert solver.last_diagnostics is None
