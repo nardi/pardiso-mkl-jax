@@ -15,7 +15,21 @@ from pardiso_mkl_jax import _mkl_loader  # noqa: F401, I001
 
 from pardiso_mkl_jax.iparm import PardisoDiagnostics, PardisoOption
 from pardiso_mkl_jax.matrix import MatrixType
-from pardiso_mkl_jax.primitive import solve
+from pardiso_mkl_jax.primitive import (
+    FactorizationToken,
+    rebuild_count,
+    reset_rebuild_count,
+    solve,
+)
 from pardiso_mkl_jax.solver import PardisoSolver
 
-__all__ = ["MatrixType", "PardisoDiagnostics", "PardisoOption", "PardisoSolver", "solve"]
+__all__ = [
+    "FactorizationToken",
+    "MatrixType",
+    "PardisoDiagnostics",
+    "PardisoOption",
+    "PardisoSolver",
+    "rebuild_count",
+    "reset_rebuild_count",
+    "solve",
+]

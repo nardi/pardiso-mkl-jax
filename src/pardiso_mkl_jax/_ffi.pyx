@@ -26,6 +26,8 @@ cdef extern from "_pardiso_ffi.h":
     void pardiso_default_iparm(long matrix_type, int32_t* out)
     long pardiso_analysis_count(long handle)
     void pardiso_reset_analysis_count(long handle)
+    long pardiso_rebuild_count()
+    void pardiso_reset_rebuild_count()
 
 
 cdef object _capsule(void* address):
@@ -91,3 +93,18 @@ def analysis_count(handle):
 def reset_analysis_count(handle):
     """Reset the analysis call counter for handle. Test hook."""
     pardiso_reset_analysis_count(int(handle))
+
+
+def rebuild_count():
+    """Number of factorization rebuilds since load or the last reset.
+
+    Rises whenever a call reaches an evicted or freed handle and has to rebuild
+    the factorization from the matrix it carries. A steadily rising count means
+    the cache is too small for the working set.
+    """
+    return pardiso_rebuild_count()
+
+
+def reset_rebuild_count():
+    """Reset the rebuild counter to zero."""
+    pardiso_reset_rebuild_count()

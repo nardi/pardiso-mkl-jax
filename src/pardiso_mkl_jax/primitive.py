@@ -2,10 +2,10 @@
 
 Wraps each XLA custom call target registered by _ffi.pyx as a plain JAX
 function. `analyze`, `reanalyze`, `factor`, `solve_stateful`, and `release`
-operate on a persistent native factorization identified by a handle, an int64
-JAX array value returned by `analyze` and threaded through every later call,
-and back the PardisoSolver class in solver.py. Because the handle is a JAX
-value rather than a Python-side id baked in at trace time, XLA orders
+operate on a persistent native factorization identified by a FactorizationToken
+returned by `analyze` and threaded through every later call, and back the
+PardisoSolver class in solver.py. Because the token carries its cache id as a
+JAX value rather than a Python-side id baked in at trace time, XLA orders
 analyze, factor, solve, and release by the same data dependencies it uses
 for any other computation, so the whole lifecycle can run inside a jitted
 function. `solve` is the stateless, functional one-shot entry point, and
@@ -76,6 +76,23 @@ def default_iparm(matrix_type: MatrixType) -> np.ndarray:
     return defaults
 
 
+def rebuild_count() -> int:
+    """Number of factorization rebuilds since load or the last reset.
+
+    A factorization is rebuilt whenever a call reaches a handle that was
+    evicted from the bounded cache or released, using the matrix the call
+    already carries. Rebuilds keep results correct but cost the redone work, so
+    a steadily rising count means the cache (PARDISO_MKL_JAX_FACTOR_CACHE) is
+    too small for how many factorizations are kept live at once.
+    """
+    return int(_ffi.rebuild_count())
+
+
+def reset_rebuild_count() -> None:
+    """Reset the rebuild counter to zero."""
+    _ffi.reset_rebuild_count()
+
+
 def _overlay_buffers(options: OptionsLike) -> tuple[jax.Array, jax.Array]:
     """Validate and expand an iparm overlay into the (mask, values) buffers the FFI call needs.
 
@@ -89,21 +106,73 @@ def _overlay_buffers(options: OptionsLike) -> tuple[jax.Array, jax.Array]:
     return jnp.asarray(mask), jnp.asarray(values)
 
 
+def _ordering_witness(solution):
+    """A zero-valued int32 that XLA cannot fold away, so it forces ordering.
+
+    Multiplying by 0.0 keeps the value zero but stays live, since 0.0 times a
+    NaN or infinity is NaN under IEEE 754. Reading one element makes the result
+    depend on the whole solve. See release.
+    """
+    return (0.0 * jnp.real(jnp.ravel(solution)[0])).astype(jnp.int32)
+
+
+@jax.tree_util.register_pytree_node_class
+class FactorizationToken:
+    """Handle to a native factorization: a cache id plus a solve counter.
+
+    n_dependent_solutions counts the solutions passed to track. release consumes
+    it, so a release is ordered after those solves even inside a jit trace.
+    """
+
+    def __init__(self, id, n_dependent_solutions=None):
+        self.id = id
+        self.n_dependent_solutions = (
+            jnp.zeros((), jnp.int32) if n_dependent_solutions is None else n_dependent_solutions
+        )
+
+    def track(self, *solutions):
+        """Return a token whose release is ordered after these solutions."""
+        count = self.n_dependent_solutions
+        for solution in solutions:
+            count = count + jnp.int32(1) + _ordering_witness(solution)
+        return FactorizationToken(self.id, count)
+
+    def tree_flatten(self):
+        return (self.id, self.n_dependent_solutions), None
+
+    @classmethod
+    def tree_unflatten(cls, aux_data, children):
+        return cls(*children)
+
+
+def _ordering_operand(token, dependency):
+    """The int32 release consumes to order itself after the wanted solves."""
+    if dependency is None:
+        return token.n_dependent_solutions
+    witness = jnp.zeros((), jnp.int32)
+    for leaf in jax.tree_util.tree_leaves(dependency):
+        leaf = jnp.asarray(leaf)
+        # Only float or complex leaves can carry an edge XLA will not fold.
+        if jnp.issubdtype(leaf.dtype, jnp.inexact):
+            witness = witness + _ordering_witness(leaf)
+    return witness
+
+
 def analyze(indptr, indices, values, *, matrix_type: MatrixType, options: OptionsLike = None):
     """Run the analyze (phase 11) step and allocate a fresh native factorization.
 
-    Returns (handle, final_iparm). The handle identifies the new
-    factorization, an int64 array value that every later call (factor,
+    Returns (token, final_iparm). The token is a FactorizationToken carrying
+    the native factorization's cache id, which every later call (factor,
     solve_stateful, factor_and_solve_stateful, release) takes as an input.
-    Threading the handle as data, rather than addressing the native state by
+    Threading the id as data, rather than addressing the native state by
     a Python-side id, is what lets XLA order the whole
     analyze-factor-solve-release lifecycle and lets it run inside a jitted
     function. final_iparm is the complete iparm array as Pardiso left it, for
     decoding into a PardisoDiagnostics.
 
     Every call allocates a new factorization. To redo the analysis for a
-    handle that already has one, use reanalyze instead, which reuses the
-    handle rather than leaving the old one for the caller to release.
+    token that already has one, use reanalyze instead, which reuses the
+    id rather than leaving the old one for the caller to release.
     """
     dimension = indptr.shape[0] - 1
     overlay_mask, overlay_values = _overlay_buffers(options)
@@ -124,24 +193,27 @@ def analyze(indptr, indices, values, *, matrix_type: MatrixType, options: Option
         matrix_type=np.int64(matrix_type),
         dimension=np.int64(dimension),
     )
-    return handle, final_iparm
+    return FactorizationToken(handle), final_iparm
 
 
 def reanalyze(
-    handle, indptr, indices, values, *, matrix_type: MatrixType, options: OptionsLike = None
+    token, indptr, indices, values, *, matrix_type: MatrixType, options: OptionsLike = None
 ):
-    """Re-run the analyze (phase 11) step in place on an existing handle.
+    """Re-run the analyze (phase 11) step in place on an existing token.
 
-    Frees the factorization currently held for handle and runs a fresh
+    Frees the factorization currently held for the token and runs a fresh
     symbolic analysis into the same native state, so this is how a caller
     redoes the analysis (for a new sparsity-compatible pattern, different
-    values, or a different overlay) without ending up holding two handles.
-    Returns (handle, final_iparm) with the handle unchanged, which keeps later
-    calls ordered against it by data dependency exactly as factor does.
+    values, or a different overlay) without ending up holding two ids.
+    Returns (token, final_iparm) with the id unchanged, which keeps later
+    calls ordered against it by data dependency exactly as factor does. The
+    returned token's solve counter is reset to zero.
 
     The numeric factorization is gone afterwards, so factor must run again
-    before any solve. Raises if handle was never analyzed or has been
-    released.
+    before any solve. If the id was evicted or released, this rebuilds it
+    from scratch instead of raising, the same self-healing behavior every
+    other stateful call has (see rebuild_count). Set
+    PARDISO_MKL_JAX_STRICT_CACHE to turn that rebuild into an error instead.
     """
     dimension = indptr.shape[0] - 1
     overlay_mask, overlay_values = _overlay_buffers(options)
@@ -154,7 +226,7 @@ def reanalyze(
         ),
         has_side_effect=True,
     )(
-        handle,
+        token.id,
         indptr,
         indices,
         values,
@@ -163,18 +235,17 @@ def reanalyze(
         matrix_type=np.int64(matrix_type),
         dimension=np.int64(dimension),
     )
-    return handle_out, final_iparm
+    return FactorizationToken(handle_out), final_iparm
 
 
-def factor(
-    handle, indptr, indices, values, *, matrix_type: MatrixType, options: OptionsLike = None
-):
-    """Run the numeric factorization (phase 22) step against handle.
+def factor(token, indptr, indices, values, *, matrix_type: MatrixType, options: OptionsLike = None):
+    """Run the numeric factorization (phase 22) step against token.
 
-    Returns (handle, final_iparm). The handle comes back unchanged, so a
-    later call that consumes this function's return value is ordered after
-    the factorization it performed. final_iparm is the complete iparm array
-    as Pardiso left it, for decoding into a PardisoDiagnostics.
+    Returns (token, final_iparm). The id comes back unchanged, so a
+    later call that consumes this function's returned token is ordered after
+    the factorization it performed. The returned token's solve counter is
+    reset to zero. final_iparm is the complete iparm array as Pardiso left it,
+    for decoding into a PardisoDiagnostics.
     """
     dimension = indptr.shape[0] - 1
     overlay_mask, overlay_values = _overlay_buffers(options)
@@ -187,7 +258,7 @@ def factor(
         ),
         has_side_effect=True,
     )(
-        handle,
+        token.id,
         indptr,
         indices,
         values,
@@ -196,11 +267,11 @@ def factor(
         matrix_type=np.int64(matrix_type),
         dimension=np.int64(dimension),
     )
-    return handle_out, final_iparm
+    return FactorizationToken(handle_out), final_iparm
 
 
 def solve_stateful(
-    handle,
+    token,
     indptr,
     indices,
     values,
@@ -210,12 +281,13 @@ def solve_stateful(
     transpose: bool = False,
     options: OptionsLike = None,
 ):
-    """Solve (phase 33) against the factorization already produced for handle.
+    """Solve (phase 33) against the factorization already produced for token.
 
     transpose solves A^T x = right_hand_side instead of A x = right_hand_side,
-    reusing the same factorization: no call to factor() is needed to switch
-    between the two for a given handle. Returns (solution, final_iparm), the
-    latter for decoding into a PardisoDiagnostics.
+    reusing the same factorization. No call to factor() is needed to switch
+    between the two for a given token. Returns (solution, final_iparm), the
+    latter for decoding into a PardisoDiagnostics. To order a later release
+    after this solve, pass the solution to token.track (see release).
     """
     dimension = indptr.shape[0] - 1
     number_of_right_hand_sides = right_hand_side.shape[0]
@@ -228,7 +300,7 @@ def solve_stateful(
         ),
         has_side_effect=True,
     )(
-        handle,
+        token.id,
         indptr,
         indices,
         values,
@@ -243,7 +315,7 @@ def solve_stateful(
 
 
 def factor_and_solve_stateful(
-    handle,
+    token,
     indptr,
     indices,
     values,
@@ -253,7 +325,7 @@ def factor_and_solve_stateful(
     transpose: bool = False,
     options: OptionsLike = None,
 ):
-    """Refactor and solve in one call, reusing the analysis produced for handle.
+    """Refactor and solve in one call, reusing the analysis produced for token.
 
     Runs Pardiso's combined phase 23 (numeric factorization then solve) for the
     given values against the stored analysis. This is a single FFI call, so the
@@ -273,7 +345,7 @@ def factor_and_solve_stateful(
         ),
         has_side_effect=True,
     )(
-        handle,
+        token.id,
         indptr,
         indices,
         values,
@@ -287,13 +359,22 @@ def factor_and_solve_stateful(
     )
 
 
-def release(handle):
-    """Free the native factorization state for handle."""
+def release(token, dependency=None):
+    """Free the native factorization state for token.
+
+    Always safe for correctness. A later call on the token rebuilds what was
+    released. Whether it actually frees depends on ordering. Inside a jit trace
+    a release is only ordered after a solve if it consumes something the solve
+    produced. Pass that solution as dependency, or call token.track(solution)
+    before releasing, so the release waits for it. With neither, the release is
+    unordered and may run first and be undone by the solve's rebuild.
+    """
+    ordering = _ordering_operand(token, dependency)
     return jax.ffi.ffi_call(
         "pardiso_mkl_jax_release",
         jax.ShapeDtypeStruct((), jnp.int32),
         has_side_effect=True,
-    )(handle)
+    )(token.id, ordering)
 
 
 def _solve_once(

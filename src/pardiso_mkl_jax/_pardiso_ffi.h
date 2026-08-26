@@ -54,6 +54,12 @@ void pardiso_default_iparm(long matrix_type, int32_t* out);
 long pardiso_analysis_count(long handle);
 void pardiso_reset_analysis_count(long handle);
 
+// Read and reset the process-wide rebuild counter. It rises whenever a call
+// lands on an evicted or freed handle and rebuilds the factorization, so a
+// rising count is the signal that the cache is too small.
+long pardiso_rebuild_count();
+void pardiso_reset_rebuild_count();
+
 }  // extern "C"
 
 #endif  // PARDISO_MKL_JAX_FFI_H_

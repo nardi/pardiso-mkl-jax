@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import functools
+from typing import Any, cast
 
 import jax
 import jax.numpy as jnp
@@ -18,7 +19,8 @@ def test_jit_matches_eager(system):
     def solve(indptr, indices, values, right_hand_side, matrix_type):
         return pmj.solve(indptr, indices, values, right_hand_side, matrix_type=matrix_type)
 
-    jit_solution = solve(
+    # cast: ty cannot model the partial(jax.jit) wrapper's call signature.
+    jit_solution = cast(Any, solve)(
         jnp.asarray(indptr),
         jnp.asarray(indices),
         jnp.asarray(values),
