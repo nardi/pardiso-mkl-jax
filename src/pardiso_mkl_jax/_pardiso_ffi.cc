@@ -34,7 +34,9 @@
 
 #include <atomic>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
+#include <list>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -155,6 +157,112 @@ void ApplyOverlay(MKL_INT* iparm, const int32_t* overlay_mask, const int32_t* ov
   }
 }
 
+// Cache bookkeeping ==================================================================
+//
+// The registry is bounded so that forgetting to release a handle leaks a
+// limited amount of memory rather than growing without end. Handles are kept
+// in an LRU list, and the least recently used one is evicted once the map
+// grows past the cache size. An evicted or released handle is not gone for
+// good: every stateful handler carries the matrix it needs, so a call landing
+// on a missing handle rebuilds its factorization from that matrix (see the
+// rebuild helpers below). This is what makes use of a freed handle safe.
+
+// Ordering of handles, most recently used at the front. Guarded by
+// RegistryMutex, like Registry itself.
+std::list<int64_t>& LruList() {
+  static std::list<int64_t> lru;
+  return lru;
+}
+
+// Counts how often a missing handle had to rebuild its factorization. A rising
+// count means the cache is too small for the working set, so this is what the
+// rebuild_count() test/diagnostic hook reports.
+std::atomic<long>& RebuildCounter() {
+  static std::atomic<long> counter{0};
+  return counter;
+}
+
+// Cache size, from PARDISO_MKL_JAX_FACTOR_CACHE, defaulting to 8 live handles.
+// Read on every access rather than cached so a test can set it per case.
+size_t CacheCapacity() {
+  const char* env = std::getenv("PARDISO_MKL_JAX_FACTOR_CACHE");
+  if (env != nullptr) {
+    char* end = nullptr;
+    long value = std::strtol(env, &end, 10);
+    if (end != env && value > 0) {
+      return static_cast<size_t>(value);
+    }
+  }
+  return 8;
+}
+
+// Whether PARDISO_MKL_JAX_STRICT_CACHE is set. In strict mode a rebuild is
+// turned into an error instead of happening silently, so a lost factorization
+// (the performance bug this guards against) surfaces loudly.
+bool StrictCache() {
+  const char* env = std::getenv("PARDISO_MKL_JAX_STRICT_CACHE");
+  return env != nullptr && env[0] != '\0' && std::strcmp(env, "0") != 0;
+}
+
+// Move a handle to the front of the LRU list. remove() is O(n) but n is the
+// cache size, a handful of entries, so this stays cheap.
+void TouchLru(int64_t handle) {
+  LruList().remove(handle);
+  LruList().push_front(handle);
+}
+
+// Free a state's native factorization (phase -1). Errors are ignored: this
+// runs during eviction, where there is no caller to report to and the memory
+// is being dropped regardless.
+void FreeState(PardisoState& state) {
+  MKL_INT maxfct = 1, mnum = 1, phase = -1, nrhs = 0, message_level = 0, error = 0;
+  pardiso(state.handle, &maxfct, &mnum, &state.matrix_type, &phase, &state.dimension,
+          /*a=*/nullptr, /*ia=*/nullptr, /*ja=*/nullptr, /*perm=*/nullptr, &nrhs, state.iparm,
+          &message_level, /*b=*/nullptr, /*x=*/nullptr, &error);
+}
+
+// Drop least-recently-used handles until the map is back within the cache
+// size. The handle in use by the current call is at the front, so it is never
+// the victim as long as the capacity is at least one.
+void EvictIfNeeded() {
+  const size_t capacity = CacheCapacity();
+  while (Registry().size() > capacity && !LruList().empty()) {
+    int64_t victim = LruList().back();
+    LruList().pop_back();
+    auto iterator = Registry().find(victim);
+    if (iterator == Registry().end()) {
+      continue;
+    }
+    FreeState(iterator->second);
+    Registry().erase(iterator);
+  }
+}
+
+// Run the symbolic analysis (phase 11) into state, from the given matrix. The
+// caller has already set state's matrix type, dimension, and iparm. pt is
+// zeroed first because Pardiso expects a clean handle for a fresh analysis.
+MKL_INT RunAnalysis(PardisoState& state, const int32_t* indptr, const int32_t* indices,
+                    const double* values) {
+  std::memset(state.handle, 0, sizeof(state.handle));
+  MKL_INT maxfct = 1, mnum = 1, phase = 11, nrhs = 0, message_level = 0, error = 0;
+  pardiso(state.handle, &maxfct, &mnum, &state.matrix_type, &phase, &state.dimension,
+          const_cast<double*>(values), AsMklInt(indptr), AsMklInt(indices), /*perm=*/nullptr,
+          &nrhs, state.iparm, &message_level, /*b=*/nullptr, /*x=*/nullptr, &error);
+  state.analysis_count += 1;
+  return error;
+}
+
+// Run the numeric factorization (phase 22) into state, from the given matrix.
+// Used only to rebuild a missing factorization before a solve.
+MKL_INT RunNumeric(PardisoState& state, const int32_t* indptr, const int32_t* indices,
+                   const double* values) {
+  MKL_INT maxfct = 1, mnum = 1, phase = 22, nrhs = 0, message_level = 0, error = 0;
+  pardiso(state.handle, &maxfct, &mnum, &state.matrix_type, &phase, &state.dimension,
+          const_cast<double*>(values), AsMklInt(indptr), AsMklInt(indices), /*perm=*/nullptr,
+          &nrhs, state.iparm, &message_level, /*b=*/nullptr, /*x=*/nullptr, &error);
+  return error;
+}
+
 }  // namespace
 
 // Hands this package's iparm defaults for a matrix type to the Python side,
@@ -182,6 +290,16 @@ extern "C" void pardiso_reset_analysis_count(long handle) {
   if (iterator != Registry().end()) {
     iterator->second.analysis_count = 0;
   }
+}
+
+// Total number of rebuilds since load (or since the last reset). Process-wide,
+// not per-handle, since a rebuild happens exactly because the handle is gone.
+extern "C" long pardiso_rebuild_count() {
+  return RebuildCounter().load();
+}
+
+extern "C" void pardiso_reset_rebuild_count() {
+  RebuildCounter().store(0);
 }
 
 namespace {
@@ -220,6 +338,9 @@ ffi::Error PardisoAnalyzeImpl(int64_t matrix_type, int64_t dimension,
           state.iparm, &message_level, /*b=*/nullptr, /*x=*/nullptr, &error);
 
   state.analysis_count += 1;
+  // Newest handle goes to the front, then evict so the cache stays bounded.
+  TouchLru(handle);
+  EvictIfNeeded();
   handle_out->typed_data()[0] = handle;
   std::memcpy(final_iparm->typed_data(), state.iparm, sizeof(MKL_INT) * 64);
   status->typed_data()[0] = static_cast<int32_t>(error);
@@ -258,37 +379,43 @@ ffi::Error PardisoReanalyzeImpl(int64_t matrix_type, int64_t dimension,
 
   std::lock_guard<std::mutex> lock(RegistryMutex());
   auto iterator = Registry().find(handle);
-  if (iterator == Registry().end()) {
-    // Unlike release, where a missing handle just means "already gone", there
-    // is nothing sensible to re-analyze here: the caller is working from a
-    // handle that was never allocated or has been freed.
+  bool missing = iterator == Registry().end();
+  // A missing handle is no longer an error: it was evicted or released, so we
+  // just analyze fresh in place under the same handle. Strict mode is the
+  // exception, turning that rebuild into a loud error for debugging.
+  if (missing && StrictCache()) {
     status->typed_data()[0] = -1;
-    return ffi::Error::Internal("pardiso reanalyze called with an unknown handle " +
-                                std::to_string(handle));
+    return ffi::Error::Internal("pardiso reanalyze: handle " + std::to_string(handle) +
+                                " was evicted or freed and strict cache mode is on");
   }
-  PardisoState& state = iterator->second;
+  if (missing) {
+    RebuildCounter().fetch_add(1);
+  }
+  PardisoState& state = Registry()[handle];
 
   MKL_INT maxfct = 1;
   MKL_INT mnum = 1;
   MKL_INT number_of_right_hand_sides = 0;
   MKL_INT message_level = 0;
 
-  // Release against the stored matrix type and dimension, which are what the
-  // existing factorization was actually allocated for. The call attributes
-  // describe the *new* analysis and only take effect below.
-  MKL_INT release_phase = -1;
-  MKL_INT release_error = 0;
-  pardiso(state.handle, &maxfct, &mnum, &state.matrix_type, &release_phase, &state.dimension,
-          /*a=*/nullptr, /*ia=*/nullptr, /*ja=*/nullptr, /*perm=*/nullptr,
-          &number_of_right_hand_sides, state.iparm, &message_level, /*b=*/nullptr, /*x=*/nullptr,
-          &release_error);
-  if (release_error != 0) {
-    status->typed_data()[0] = static_cast<int32_t>(release_error);
-    return ffi::Error::Internal(PardisoErrorMessage("reanalyze release", release_error));
+  if (!missing) {
+    // Release the existing factorization first, against the matrix type and
+    // dimension it was allocated for. The call attributes describe the *new*
+    // analysis and only take effect below.
+    MKL_INT release_phase = -1;
+    MKL_INT release_error = 0;
+    pardiso(state.handle, &maxfct, &mnum, &state.matrix_type, &release_phase, &state.dimension,
+            /*a=*/nullptr, /*ia=*/nullptr, /*ja=*/nullptr, /*perm=*/nullptr,
+            &number_of_right_hand_sides, state.iparm, &message_level, /*b=*/nullptr,
+            /*x=*/nullptr, &release_error);
+    if (release_error != 0) {
+      status->typed_data()[0] = static_cast<int32_t>(release_error);
+      return ffi::Error::Internal(PardisoErrorMessage("reanalyze release", release_error));
+    }
   }
 
-  // Pardiso expects a zeroed pt going into a fresh phase 11. The release
-  // above frees what pt pointed at but does not clear the array itself.
+  // Pardiso expects a zeroed pt going into a fresh phase 11. The release above
+  // (when there was one) frees what pt pointed at but does not clear the array.
   std::memset(state.handle, 0, sizeof(state.handle));
   state.matrix_type = static_cast<MKL_INT>(matrix_type);
   state.dimension = static_cast<MKL_INT>(dimension);
@@ -304,6 +431,8 @@ ffi::Error PardisoReanalyzeImpl(int64_t matrix_type, int64_t dimension,
           state.iparm, &message_level, /*b=*/nullptr, /*x=*/nullptr, &error);
 
   state.analysis_count += 1;
+  TouchLru(handle);
+  EvictIfNeeded();
   handle_out->typed_data()[0] = handle;
   std::memcpy(final_iparm->typed_data(), state.iparm, sizeof(MKL_INT) * 64);
   status->typed_data()[0] = static_cast<int32_t>(error);
@@ -328,11 +457,33 @@ ffi::Error PardisoFactorImpl(int64_t matrix_type, int64_t dimension,
   int64_t handle = handle_in.typed_data()[0];
 
   std::lock_guard<std::mutex> lock(RegistryMutex());
+  bool missing = Registry().find(handle) == Registry().end();
+  handle_out->typed_data()[0] = handle;
+  // A missing handle lost its analysis to eviction or release. We rebuild it
+  // below from the matrix this call carries. Strict mode reports it instead.
+  if (missing && StrictCache()) {
+    std::memset(final_iparm->typed_data(), 0, sizeof(int32_t) * 64);
+    status->typed_data()[0] = -1;
+    return ffi::Error::Internal("pardiso factor: handle " + std::to_string(handle) +
+                                " was evicted or freed and strict cache mode is on");
+  }
+
   PardisoState& state = Registry()[handle];
   state.matrix_type = static_cast<MKL_INT>(matrix_type);
   state.dimension = static_cast<MKL_INT>(dimension);
   InitializeIparm(state.iparm, state.matrix_type);
   ApplyOverlay(state.iparm, options_mask.typed_data(), options_values.typed_data());
+
+  if (missing) {
+    RebuildCounter().fetch_add(1);
+    MKL_INT analyze_error =
+        RunAnalysis(state, indptr.typed_data(), indices.typed_data(), values.typed_data());
+    if (analyze_error != 0) {
+      std::memcpy(final_iparm->typed_data(), state.iparm, sizeof(MKL_INT) * 64);
+      status->typed_data()[0] = static_cast<int32_t>(analyze_error);
+      return ffi::Error::Internal(PardisoErrorMessage("factor rebuild analyze", analyze_error));
+    }
+  }
 
   MKL_INT maxfct = 1;
   MKL_INT mnum = 1;
@@ -346,7 +497,8 @@ ffi::Error PardisoFactorImpl(int64_t matrix_type, int64_t dimension,
           AsMklInt(indices.typed_data()), /*perm=*/nullptr, &number_of_right_hand_sides,
           state.iparm, &message_level, /*b=*/nullptr, /*x=*/nullptr, &error);
 
-  handle_out->typed_data()[0] = handle;
+  TouchLru(handle);
+  EvictIfNeeded();
   std::memcpy(final_iparm->typed_data(), state.iparm, sizeof(MKL_INT) * 64);
   status->typed_data()[0] = static_cast<int32_t>(error);
   if (error != 0) {
@@ -374,6 +526,17 @@ ffi::Error PardisoSolveImpl(int64_t matrix_type, int64_t dimension,
   int64_t handle = handle_in.typed_data()[0];
 
   std::lock_guard<std::mutex> lock(RegistryMutex());
+  bool missing = Registry().find(handle) == Registry().end();
+  // A missing handle lost both its analysis and its factorization. A solve
+  // needs both, so we rebuild them from this call's matrix before solving.
+  // Strict mode reports the miss instead of quietly redoing the work.
+  if (missing && StrictCache()) {
+    std::memset(solution->typed_data(), 0, solution->element_count() * sizeof(double));
+    std::memset(final_iparm->typed_data(), 0, sizeof(int32_t) * 64);
+    return ffi::Error::Internal("pardiso solve: handle " + std::to_string(handle) +
+                                " was evicted or freed and strict cache mode is on");
+  }
+
   PardisoState& state = Registry()[handle];
   state.matrix_type = static_cast<MKL_INT>(matrix_type);
   state.dimension = static_cast<MKL_INT>(dimension);
@@ -387,6 +550,20 @@ ffi::Error PardisoSolveImpl(int64_t matrix_type, int64_t dimension,
   // to resolve here.
   state.iparm[11] = static_cast<MKL_INT>(transpose_mode);
 
+  if (missing) {
+    RebuildCounter().fetch_add(1);
+    MKL_INT rebuild_error =
+        RunAnalysis(state, indptr.typed_data(), indices.typed_data(), values.typed_data());
+    if (rebuild_error == 0) {
+      rebuild_error =
+          RunNumeric(state, indptr.typed_data(), indices.typed_data(), values.typed_data());
+    }
+    if (rebuild_error != 0) {
+      std::memcpy(final_iparm->typed_data(), state.iparm, sizeof(MKL_INT) * 64);
+      return ffi::Error::Internal(PardisoErrorMessage("solve rebuild", rebuild_error));
+    }
+  }
+
   MKL_INT maxfct = 1;
   MKL_INT mnum = 1;
   MKL_INT phase_value = 33;
@@ -399,6 +576,8 @@ ffi::Error PardisoSolveImpl(int64_t matrix_type, int64_t dimension,
           AsMklInt(indices.typed_data()), /*perm=*/nullptr, &nrhs, state.iparm, &message_level,
           const_cast<double*>(right_hand_side.typed_data()), solution->typed_data(), &error);
 
+  TouchLru(handle);
+  EvictIfNeeded();
   std::memcpy(final_iparm->typed_data(), state.iparm, sizeof(MKL_INT) * 64);
   if (error != 0) {
     return ffi::Error::Internal(PardisoErrorMessage("solve", error));
@@ -424,6 +603,17 @@ ffi::Error PardisoFactorSolveImpl(int64_t matrix_type, int64_t dimension,
   int64_t handle = handle_in.typed_data()[0];
 
   std::lock_guard<std::mutex> lock(RegistryMutex());
+  bool missing = Registry().find(handle) == Registry().end();
+  // A missing handle lost its analysis. Phase 23 refactors and solves but
+  // still needs an analysis to reuse, so we rebuild that from this call's
+  // matrix. Strict mode reports the miss instead.
+  if (missing && StrictCache()) {
+    std::memset(solution->typed_data(), 0, solution->element_count() * sizeof(double));
+    std::memset(final_iparm->typed_data(), 0, sizeof(int32_t) * 64);
+    return ffi::Error::Internal("pardiso factor_and_solve: handle " + std::to_string(handle) +
+                                " was evicted or freed and strict cache mode is on");
+  }
+
   PardisoState& state = Registry()[handle];
   state.matrix_type = static_cast<MKL_INT>(matrix_type);
   state.dimension = static_cast<MKL_INT>(dimension);
@@ -433,6 +623,17 @@ ffi::Error PardisoFactorSolveImpl(int64_t matrix_type, int64_t dimension,
   // transpose is not left with a stale value from an earlier one. Applied
   // after ApplyOverlay for the same reason given there.
   state.iparm[11] = static_cast<MKL_INT>(transpose_mode);
+
+  if (missing) {
+    RebuildCounter().fetch_add(1);
+    MKL_INT analyze_error =
+        RunAnalysis(state, indptr.typed_data(), indices.typed_data(), values.typed_data());
+    if (analyze_error != 0) {
+      std::memcpy(final_iparm->typed_data(), state.iparm, sizeof(MKL_INT) * 64);
+      return ffi::Error::Internal(
+          PardisoErrorMessage("factor_and_solve rebuild analyze", analyze_error));
+    }
+  }
 
   MKL_INT maxfct = 1;
   MKL_INT mnum = 1;
@@ -446,6 +647,8 @@ ffi::Error PardisoFactorSolveImpl(int64_t matrix_type, int64_t dimension,
           AsMklInt(indices.typed_data()), /*perm=*/nullptr, &nrhs, state.iparm, &message_level,
           const_cast<double*>(right_hand_side.typed_data()), solution->typed_data(), &error);
 
+  TouchLru(handle);
+  EvictIfNeeded();
   std::memcpy(final_iparm->typed_data(), state.iparm, sizeof(MKL_INT) * 64);
   if (error != 0) {
     return ffi::Error::Internal(PardisoErrorMessage("factor_and_solve", error));
@@ -455,7 +658,12 @@ ffi::Error PardisoFactorSolveImpl(int64_t matrix_type, int64_t dimension,
 
 // Frees the native memory for handle (phase -1) and drops it from the
 // registry. A handle that is not present is treated as already released.
-ffi::Error PardisoReleaseImpl(ffi::Buffer<ffi::S64> handle_in, ffi::ResultBuffer<ffi::S32> status) {
+// ordering is an unused operand whose only job is to give XLA a data
+// dependency, so a release inside a jit trace runs after the solves it must
+// follow. See primitive.release.
+ffi::Error PardisoReleaseImpl(ffi::Buffer<ffi::S64> handle_in, ffi::Buffer<ffi::S32> ordering,
+                              ffi::ResultBuffer<ffi::S32> status) {
+  (void)ordering;
   int64_t handle = handle_in.typed_data()[0];
 
   std::lock_guard<std::mutex> lock(RegistryMutex());
@@ -478,6 +686,7 @@ ffi::Error PardisoReleaseImpl(ffi::Buffer<ffi::S64> handle_in, ffi::ResultBuffer
           &message_level, /*b=*/nullptr, /*x=*/nullptr, &error);
 
   Registry().erase(iterator);
+  LruList().remove(handle);
   status->typed_data()[0] = static_cast<int32_t>(error);
   if (error != 0) {
     return ffi::Error::Internal(PardisoErrorMessage("release", error));
@@ -617,6 +826,7 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(kPardisoFactorSolveHandler, PardisoFactorSolveImpl
 XLA_FFI_DEFINE_HANDLER_SYMBOL(kPardisoReleaseHandler, PardisoReleaseImpl,
                                ffi::Ffi::Bind()
                                    .Arg<ffi::Buffer<ffi::S64>>()  // handle
+                                   .Arg<ffi::Buffer<ffi::S32>>()  // ordering (unused)
                                    .Ret<ffi::Buffer<ffi::S32>>()  // status
 );
 

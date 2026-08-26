@@ -65,7 +65,7 @@ def test_solve_transpose_reuses_factorization(system):
     ) as solver:
         solver.analyze(jnp.asarray(values))
         solver.factorize(jnp.asarray(values))
-        assert _ffi.analysis_count(solver._handle) == 1
+        assert _ffi.analysis_count(handle_value(solver)) == 1
 
         # Alternating transpose and non-transpose solves on the same
         # factorization must each give the right answer, with no
@@ -73,7 +73,7 @@ def test_solve_transpose_reuses_factorization(system):
         non_transpose = solver.solve(jnp.asarray(right_hand_side))
         transpose = solver.solve(jnp.asarray(right_hand_side), transpose=True)
         non_transpose_again = solver.solve(jnp.asarray(right_hand_side))
-        assert _ffi.analysis_count(solver._handle) == 1
+        assert _ffi.analysis_count(handle_value(solver)) == 1
 
     np.testing.assert_allclose(
         np.asarray(non_transpose), np.linalg.solve(dense, right_hand_side), rtol=1e-8, atol=1e-10
@@ -95,14 +95,14 @@ def test_refactorize_updates_values_without_reanalyzing(system):
         jnp.asarray(indptr), jnp.asarray(indices), matrix_type=matrix_type
     ) as solver:
         solver.analyze(jnp.asarray(values))
-        assert _ffi.analysis_count(solver._handle) == 1
+        assert _ffi.analysis_count(handle_value(solver)) == 1
 
         solver.factorize(jnp.asarray(values))
-        assert _ffi.analysis_count(solver._handle) == 1
+        assert _ffi.analysis_count(handle_value(solver)) == 1
 
         new_values = values * 2.0
         solver.refactorize(jnp.asarray(new_values))
-        assert _ffi.analysis_count(solver._handle) == 1
+        assert _ffi.analysis_count(handle_value(solver)) == 1
 
         solution = solver.solve(jnp.asarray(right_hand_side))
         expected = np.linalg.solve(dense * 2.0, right_hand_side)
@@ -122,12 +122,12 @@ def test_refactor_and_solve_reuses_analysis_under_jit(system):
         jnp.asarray(indptr), jnp.asarray(indices), matrix_type=matrix_type
     ) as solver:
         solver.analyze(jnp.asarray(values))
-        assert _ffi.analysis_count(solver._handle) == 1
+        assert _ffi.analysis_count(handle_value(solver)) == 1
 
         run = jax.jit(lambda v, b: solver.refactor_and_solve(v, b))
         first = run(jnp.asarray(values), jnp.asarray(right_hand_side))
         second = run(jnp.asarray(values * 2.0), jnp.asarray(right_hand_side))
-        assert _ffi.analysis_count(solver._handle) == 1
+        assert _ffi.analysis_count(handle_value(solver)) == 1
 
     np.testing.assert_allclose(
         np.asarray(first), np.linalg.solve(dense, right_hand_side), rtol=1e-8, atol=1e-10
@@ -187,12 +187,10 @@ def test_whole_lifecycle_inside_jit_reuses_analysis(system):
             right_hand_side[None, :],
             matrix_type=matrix_type,
         )
-        # release() and the two solves above all consume handle directly, so
-        # nothing otherwise orders release after them: without a forced
-        # dependency on their outputs, XLA is free to run release first,
-        # which would erase the registry entry the solves still need.
-        handle, _ = jax.lax.optimization_barrier((handle, (first, second)))
-        status = primitive.release(handle)
+        # release() and the two solves above all consume the token's id
+        # directly, so nothing otherwise orders release after them. Tracking
+        # both solutions ties the release to them so it runs last.
+        status = primitive.release(handle.track(first, second))
         return first[0], second[0], status
 
     first, second, _status = jax.jit(run)(
@@ -219,24 +217,23 @@ def test_whole_lifecycle_inside_jit_does_not_leak_handles(system):
         solution, _iparm = primitive.factor_and_solve_stateful(
             handle, indptr, indices, values, right_hand_side[None, :], matrix_type=matrix_type
         )
-        # Forces release() to run after the solve above, for the same reason
-        # as in test_whole_lifecycle_inside_jit_reuses_analysis.
-        ordered_handle, _ = jax.lax.optimization_barrier((handle, solution))
-        primitive.release(ordered_handle)
+        # Tracking the solution forces release() to run after the solve above,
+        # for the same reason as in test_whole_lifecycle_inside_jit_reuses_analysis.
+        primitive.release(handle.track(solution))
         return solution[0], handle
 
     run_jit = jax.jit(run)
     handles_seen = set()
     for _ in range(10):
         solution, handle = run_jit(values, right_hand_side)
-        handles_seen.add(int(handle))
+        handles_seen.add(int(handle.id))
         np.testing.assert_allclose(
             np.asarray(solution), np.linalg.solve(dense, right_hand_side), rtol=1e-8, atol=1e-10
         )
         # release() already ran inside the trace, so the registry entry for
         # this handle must be gone: analysis_count falls back to 0 for a
         # handle it does not recognize.
-        assert _ffi.analysis_count(handle) == 0
+        assert _ffi.analysis_count(handle.id) == 0
 
     # A fresh handle is allocated on every call, never reused while a prior
     # one might still be referenced.
@@ -259,7 +256,7 @@ def test_many_create_close_cycles_do_not_leak(system):
 def handle_value(solver) -> int:
     """The solver's native handle as a plain int, for comparing across calls."""
     assert solver._handle is not None
-    return int(solver._handle)
+    return int(solver._handle.id)
 
 
 def test_analyze_again_reanalyzes_in_place(system):
@@ -365,8 +362,8 @@ def test_reanalyze_primitive_inside_and_outside_jit(system):
 
     # Two analyses ran on each handle, so the re-analysis was neither dropped
     # nor reordered ahead of the analyze that created the entry.
-    assert _ffi.analysis_count(traced_handle) == 2
-    assert _ffi.analysis_count(eager_handle) == 2
+    assert _ffi.analysis_count(traced_handle.id) == 2
+    assert _ffi.analysis_count(eager_handle.id) == 2
     primitive.release(traced_handle)
     primitive.release(eager_handle)
 
@@ -376,8 +373,15 @@ def test_reanalyze_primitive_inside_and_outside_jit(system):
     np.testing.assert_allclose(np.asarray(traced), np.asarray(eager), rtol=1e-12, atol=1e-14)
 
 
-def test_reanalyze_rejects_an_unknown_handle(any_system):
-    indptr, indices, values, _dense, _right_hand_side = any_system
+def test_reanalyze_rebuilds_an_evicted_handle(any_system):
+    """Re-analyzing a released handle rebuilds it rather than failing.
+
+    A handle whose factorization was released (or evicted from the bounded
+    cache) is not dead. reanalyze runs a fresh analysis under the same handle
+    from the matrix it is handed, so this checks the rebuild is counted and
+    leaves a handle that a later factor and solve still use correctly.
+    """
+    indptr, indices, values, dense, right_hand_side = any_system
     indptr = jnp.asarray(indptr)
     indices = jnp.asarray(indices)
     values = jnp.asarray(values)
@@ -385,19 +389,31 @@ def test_reanalyze_rejects_an_unknown_handle(any_system):
 
     handle, _iparm = primitive.analyze(indptr, indices, values, matrix_type=matrix_type)
     primitive.release(handle)
-    with pytest.raises(Exception, match="unknown handle"):
-        primitive.reanalyze(handle, indptr, indices, values, matrix_type=matrix_type)
+
+    primitive.reset_rebuild_count()
+    handle, _iparm = primitive.reanalyze(handle, indptr, indices, values, matrix_type=matrix_type)
+    assert primitive.rebuild_count() == 1
+
+    handle, _iparm = primitive.factor(handle, indptr, indices, values, matrix_type=matrix_type)
+    stacked_rhs = jnp.asarray(right_hand_side)[None, :]
+    solution, _iparm = primitive.solve_stateful(
+        handle, indptr, indices, values, stacked_rhs, matrix_type=matrix_type
+    )
+    primitive.release(handle)
+    expected = np.linalg.solve(dense, right_hand_side)
+    np.testing.assert_allclose(np.asarray(solution[0]), expected, rtol=1e-8, atol=1e-10)
 
 
-def test_a_failed_reanalysis_leaves_the_solver_unusable(any_system):
-    """A re-analysis that fails reports no analysis, rather than the state it had going in.
+def test_solver_self_heals_after_a_backdoor_release(any_system):
+    """A solve still works after the handle is released behind the solver's back.
 
-    Re-analysis frees the existing factorization before doing anything else,
-    so once it has failed there is nothing left to fall back on. Provoked here
-    by releasing the handle behind the solver's back, which is the one way to
-    make the native call fail on demand.
+    Releasing through the primitive frees the native factorization the solver
+    believes it still holds. The next solve lands on a missing handle and
+    rebuilds from the matrix it carries, so the answer stays correct and the
+    rebuild counter records the heal. This is the core use-after-free-is-safe
+    guarantee, exercised from the solver.
     """
-    indptr, indices, values, _dense, right_hand_side = any_system
+    indptr, indices, values, dense, right_hand_side = any_system
     with pmj.PardisoSolver(
         jnp.asarray(indptr), jnp.asarray(indices), matrix_type=pmj.MatrixType.REAL_NONSYMMETRIC
     ) as solver:
@@ -405,34 +421,34 @@ def test_a_failed_reanalysis_leaves_the_solver_unusable(any_system):
         solver.factorize(jnp.asarray(values))
         primitive.release(solver._handle)
 
-        with pytest.raises(Exception, match="unknown handle"):
-            solver.analyze(jnp.asarray(values))
-
-        with pytest.raises(RuntimeError, match="analyze"):
-            solver.factorize(jnp.asarray(values))
-        with pytest.raises(RuntimeError, match="factorize"):
-            solver.solve(jnp.asarray(right_hand_side))
-        with pytest.raises(RuntimeError, match="analyze"):
-            solver.refactor_and_solve(jnp.asarray(values), jnp.asarray(right_hand_side))
-
-        # close() would otherwise release a handle that is already gone. That
-        # is harmless natively, but there is no reason to make the test do it.
-        solver._handle = None
+        primitive.reset_rebuild_count()
+        solution = solver.solve(jnp.asarray(right_hand_side))
+        assert primitive.rebuild_count() >= 1
+    expected = np.linalg.solve(dense, right_hand_side)
+    np.testing.assert_allclose(np.asarray(solution), expected, rtol=1e-8, atol=1e-10)
 
 
-# The lifecycle and precondition checks below (context manager enforcement,
-# method ordering, idempotent close) do not depend on the matrix type: they
-# are raised before Pardiso ever sees the values, so they run once against
-# a single representative system rather than once per matrix type.
+# The lifecycle and precondition checks below (method ordering, idempotent
+# close, use without a with-block) do not depend on the matrix type, so they
+# run once against a single representative system rather than once per type.
 
 
-def test_methods_require_context_manager(any_system):
-    indptr, indices, values, _dense, _right_hand_side = any_system
+def test_methods_work_without_context_manager(any_system):
+    """The solver no longer needs a with-block to be used.
+
+    Self-healing removed the leak that once made the context manager mandatory,
+    so a plain instance analyzes, factorizes, and solves correctly on its own.
+    """
+    indptr, indices, values, dense, right_hand_side = any_system
     solver = pmj.PardisoSolver(
         jnp.asarray(indptr), jnp.asarray(indices), matrix_type=pmj.MatrixType.REAL_NONSYMMETRIC
     )
-    with pytest.raises(RuntimeError, match="context manager"):
-        solver.analyze(jnp.asarray(values))
+    solver.analyze(jnp.asarray(values))
+    solver.factorize(jnp.asarray(values))
+    solution = solver.solve(jnp.asarray(right_hand_side))
+    solver.close()
+    expected = np.linalg.solve(dense, right_hand_side)
+    np.testing.assert_allclose(np.asarray(solution), expected, rtol=1e-8, atol=1e-10)
 
 
 def test_methods_reject_use_after_close(any_system):

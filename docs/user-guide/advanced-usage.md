@@ -26,9 +26,12 @@ into separate calls, so you control exactly what work happens on each one:
   jitted function, see [Composing inside jax.jit](#composing-inside-jaxjit)
   below.
 
-`PardisoSolver` must be used as a context manager: its native memory is
-released in `__exit__`, not in a destructor, since Python does not guarantee
-when or whether `__del__` runs.
+`PardisoSolver` can be used as a context manager, which releases its native
+memory on exit, but this is optional. Every handle is a key into a bounded
+cache (see [Memory and the handle cache](#memory-and-the-handle-cache) below),
+so a solver you never close leaks at most one cache slot, not unbounded memory,
+and reusing it after it was released still works. Use the `with` block, or call
+`close()`, to free that slot promptly.
 
 ```python
 import jax
@@ -110,8 +113,8 @@ orders the re-analysis against the calls around it by data dependency.
 
 ## Composing inside jax.jit
 
-A `PardisoSolver`'s factorization is identified by a handle, an ordinary
-`int64` JAX array value threaded through `analyze`, `factor`, `solve`, and
+A `PardisoSolver`'s factorization is identified by a token, a small bundle
+carrying an `int64` cache id, threaded through `analyze`, `factor`, `solve`, and
 `release` under the hood. Once a solver has
 been analyzed, `refactor_and_solve` and `solve` can be called any number of
 times entirely inside a jitted function, with the analysis reused across
@@ -144,22 +147,23 @@ with pmj.PardisoSolver(
     first, second = solve_two(values, values * 2.0, right_hand_side)
 ```
 
-To use `analyze` itself inside JIT, you need to use the lower-level API (see
-next section). This is necessary because the memory associated with the handle
-must be freed, and XLA can arbitrarily reorder operations if there is no
-dependency between them. Because the handle is data, XLA orders the whole
-lifecycle by data dependency, the same way it orders any other computation,
-which requires manual handle management and creating an explicit dependency on
-the results, for example with `jax.lax.optimization_barrier`..
+To use `analyze` itself inside JIT, use the lower-level API (see next section)
+and thread the token through `analyze`, `factor`, `solve`, and `release`
+yourself. Because the token's id is data, XLA orders analyze, factor, and solve
+by data dependency, the same way it orders any other computation. Ordering a
+`release` after the solves that used it takes one extra step, covered in
+[When is it safe to release explicitly?](#when-is-it-safe-to-release-explicitly)
+below.
 
 ## Building on the low-level primitives
 
 `PardisoSolver` itself is built on the functions in
 [`pardiso_mkl_jax.primitive`][pardiso_mkl_jax.primitive]: `analyze`,
 `reanalyze`, `factor`, `solve_stateful`, `factor_and_solve_stateful`, and
-`release`. Each one threads a handle value in and, except for
-`solve_stateful`, back out again. Library authors who want to manage a
-factorization's lifetime
+`release`. Each one takes a
+[`FactorizationToken`][pardiso_mkl_jax.FactorizationToken] and, except for
+`solve_stateful`, `factor_and_solve_stateful`, and `release`, returns one. Library authors
+who want to manage a factorization's lifetime
 explicitly, rather than through `PardisoSolver`'s own context manager, for
 example tying it to a scope object or to another jit-traced dependency, can
 call these functions directly:
@@ -179,11 +183,11 @@ values = jnp.array([4.0, 1.0, 3.0, 2.0], dtype=jnp.float64)
 right_hand_side = jnp.array([1.0, 2.0, 3.0], dtype=jnp.float64)
 matrix_type = pmj.MatrixType.REAL_NONSYMMETRIC
 
-handle, _final_iparm = primitive.analyze(indptr, indices, values, matrix_type=matrix_type)
+token, _final_iparm = primitive.analyze(indptr, indices, values, matrix_type=matrix_type)
 solution, final_iparm = primitive.factor_and_solve_stateful(
-    handle, indptr, indices, values, right_hand_side[None, :], matrix_type=matrix_type
+    token, indptr, indices, values, right_hand_side[None, :], matrix_type=matrix_type
 )
-primitive.release(handle)
+primitive.release(token)
 ```
 
 Every primitive returns the raw `iparm` array Pardiso left behind alongside
@@ -192,11 +196,123 @@ its usual result, and takes an `options` overlay; see
 raw array with
 [`PardisoDiagnostics.from_iparm`][pardiso_mkl_jax.PardisoDiagnostics].
 
-As with `PardisoSolver`, releasing a handle while something else might still
-use it is a bug: since `release` and any other consumer of `handle` share no
-ordering beyond their common input, a caller that wants a release ordered
-after a particular use should force that dependency explicitly, for example
-with `jax.lax.optimization_barrier`.
+Releasing a token that something else still uses is safe for correctness.
+`release` frees the cache slot, but the token stays valid. The next time it is used the factorization is rebuilt from the matrix it carries. Whether an
+early release actually frees anything is a separate question, covered in
+[When is it safe to release explicitly?](#when-is-it-safe-to-release-explicitly)
+below.
+
+## Memory and the handle cache
+
+A token's cache id is not a raw pointer. It is a key into a process-wide cache of
+factorizations, and this is what makes the token API memory-safe:
+
+- **Forgetting to release leaks a bounded amount.** The cache holds a fixed
+  number of factorizations, eight by default. Once it is full the
+  least-recently-used one is evicted, so tokens you never release cost at most
+  a full cache rather than growing without end. Set the size with the
+  `PARDISO_MKL_JAX_FACTOR_CACHE` environment variable.
+- **Using an evicted or released token is safe.** Every stateful call carries
+  the matrix it needs, so a call that lands on a token no longer in the cache
+  rebuilds its factorization on the spot and continues. The answer is the same,
+  it just costs the rebuild.
+
+Rebuilds are correct but not free, so a program that keeps more factorizations
+live than the cache holds pays to rebuild them over and over. Two tools help
+find that:
+
+- [`pardiso_mkl_jax.rebuild_count`][pardiso_mkl_jax.rebuild_count] returns how
+  many rebuilds have happened. A count that climbs during steady-state solving
+  means the cache is too small for the working set. Reset it with
+  `reset_rebuild_count`.
+- Setting `PARDISO_MKL_JAX_STRICT_CACHE` turns any rebuild into an error that
+  names the token, so a lost factorization fails loudly instead of quietly
+  slowing things down. Leave it off in production and switch it on while
+  debugging performance.
+
+### When is it safe to release explicitly?
+
+There are two aspects to distunguish here:
+
+**Correctness: always safe.** A released token rebuilds itself on next use, so
+`release` (or `PardisoSolver.close`) can be called at any point without risk of a
+crash or a wrong answer.
+
+**Effectiveness: only when the release runs after the token's last use.** A
+release reclaims memory without forcing a wasted rebuild only if nothing uses the
+token afterward. Releasing eagerly in Python, after the step that used the
+token has run, gives you that ordering for free:
+
+```python
+import jax
+
+jax.config.update("jax_enable_x64", True)
+
+import jax.numpy as jnp
+import pardiso_mkl_jax as pmj
+from pardiso_mkl_jax import primitive
+
+indptr = jnp.array([0, 2, 3, 4], dtype=jnp.int32)
+indices = jnp.array([0, 1, 1, 2], dtype=jnp.int32)
+values = jnp.array([4.0, 1.0, 3.0, 2.0], dtype=jnp.float64)
+right_hand_side = jnp.array([1.0, 2.0, 3.0], dtype=jnp.float64)
+matrix_type = pmj.MatrixType.REAL_NONSYMMETRIC
+
+token, _ = primitive.analyze(indptr, indices, values, matrix_type=matrix_type)
+token, _ = primitive.factor(token, indptr, indices, values, matrix_type=matrix_type)
+
+solution, _ = primitive.solve_stateful(
+    token, indptr, indices, values, right_hand_side[None, :], matrix_type=matrix_type
+)
+# Runs after the solve above, so it actually frees rather than costing a rebuild.
+primitive.release(token)
+```
+
+Inside a single `jax.jit` trace there is no ordering between a release and a
+solve that both take the same token, because a bare `release` does not consume
+the solve's output. XLA may run the release first, in which case the solve
+rebuilds the factorization and the release reclaims nothing. To order the
+release after a solve, give it that solve's solution to depend on, either with
+`release(token, dependency=solution)` or by calling `token.track(solution)`
+first. Both make the release wait for the solve, so it actually frees:
+
+```python
+import jax
+
+jax.config.update("jax_enable_x64", True)
+
+import jax.numpy as jnp
+import pardiso_mkl_jax as pmj
+from pardiso_mkl_jax import primitive
+
+indptr = jnp.array([0, 2, 3, 4], dtype=jnp.int32)
+indices = jnp.array([0, 1, 1, 2], dtype=jnp.int32)
+values = jnp.array([4.0, 1.0, 3.0, 2.0], dtype=jnp.float64)
+right_hand_side = jnp.array([1.0, 2.0, 3.0], dtype=jnp.float64)
+matrix_type = pmj.MatrixType.REAL_NONSYMMETRIC
+
+token, _ = primitive.analyze(indptr, indices, values, matrix_type=matrix_type)
+token, _ = primitive.factor(token, indptr, indices, values, matrix_type=matrix_type)
+
+
+@jax.jit
+def solve_and_release(token, values, right_hand_side):
+    solution, _ = primitive.solve_stateful(
+        token, indptr, indices, values, right_hand_side[None, :], matrix_type=matrix_type
+    )
+    primitive.release(token, dependency=solution)
+    return solution
+
+
+solution = solve_and_release(token, values, right_hand_side)
+```
+
+`token.track(solution)` does the same by folding the solve into the token, which
+is handy in a loop: track each step's solution, then release the token once after
+the loop to free it after every solve.
+
+Explicit releases are rarely worth it. Letting the cache evict costs the same in
+the worst case, with none of the bookkeeping.
 
 ## Solving the transpose
 

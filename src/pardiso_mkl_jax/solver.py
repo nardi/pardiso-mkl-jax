@@ -62,16 +62,21 @@ class PardisoSolver:
     form to use under jit, where last_diagnostics is unavailable; see its
     docstring.
 
-    PardisoSolver must be used as a context manager. Its native memory is
-    released in __exit__, not in a destructor: Python does not guarantee when
-    or whether __del__ runs, so relying on it could leave the native
-    factorization alive far longer than intended, or leak it entirely if the
-    interpreter is shutting down.
+    PardisoSolver may be used as a context manager, which releases its native
+    memory on exit, but this is optional. The cache behind every handle is
+    bounded (set by PARDISO_MKL_JAX_FACTOR_CACHE), and any factorization that is
+    evicted or released is rebuilt on next use from the matrix the call carries.
+    So a solver that is never closed leaks at most one cache slot rather than
+    unbounded memory, and reusing it after close() still works, it just rebuilds
+    once. Close it, or use the with-block, to free that slot promptly.
 
         with PardisoSolver(indptr, indices, matrix_type=MatrixType.REAL_NONSYMMETRIC) as solver:
             solver.analyze(values)
             solver.factorize(values)
             x = solver.solve(b)
+
+    The same calls work without the with-block, and close() stays available to
+    release early.
     """
 
     def __init__(self, indptr, indices, *, matrix_type: MatrixType, options: OptionsLike = None):
@@ -84,11 +89,10 @@ class PardisoSolver:
         self._dimension = matrix_dimension(indptr)
         # Validated once here rather than on every call that merges it in.
         self._options = canonicalize_overlay(options)
-        # The handle is only obtained from analyze(), which allocates it on
-        # the native side, so there is nothing to hold until then.
-        self._handle: jax.Array | None = None
+        # The token is only obtained from analyze(), which allocates the native
+        # factorization it names, so there is nothing to hold until then.
+        self._handle: primitive.FactorizationToken | None = None
         self._values = None
-        self._entered = False
         self._closed = False
         self._analyzed = False
         self._factorized = False
@@ -98,14 +102,19 @@ class PardisoSolver:
         self._analysis_pivot_settings: dict[int, int] = {}
 
     def __enter__(self) -> PardisoSolver:
-        self._entered = True
         return self
 
     def __exit__(self, exc_type, exc_value, traceback) -> None:
         self.close()
 
     def close(self) -> None:
-        """Release the native factorization. Called automatically by __exit__."""
+        """Release the native factorization. Called automatically by __exit__.
+
+        Safe to call at any time. A later use of the solver rebuilds what was
+        released. It only reclaims memory without a wasted rebuild when it runs
+        after the last solve, which is the case here since close runs eagerly in
+        Python. See the advanced-usage guide on releasing explicitly.
+        """
         if not self._closed:
             if self._handle is not None:
                 primitive.release(self._handle)
@@ -179,11 +188,8 @@ class PardisoSolver:
         return diagnostics
 
     def _check_usable(self) -> None:
-        if not self._entered:
-            raise RuntimeError(
-                "PardisoSolver must be used as a context manager: "
-                "'with PardisoSolver(...) as solver: ...'."
-            )
+        # The context manager is optional now that a released factorization
+        # rebuilds itself, so only a genuine close() blocks further use.
         if self._closed:
             raise RuntimeError("PardisoSolver is closed and can no longer be used.")
 
