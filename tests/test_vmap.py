@@ -8,6 +8,9 @@ import numpy as np
 import pytest
 
 import pardiso_mkl_jax as pmj
+from pardiso_mkl_jax import primitive
+
+MATRIX_TYPE = pmj.MatrixType.REAL_NONSYMMETRIC
 
 
 def _stacked_single_solves(indptr, indices, values_batch, right_hand_side_batch, matrix_type):
@@ -118,6 +121,117 @@ def test_vmap_over_pattern_arrays_is_rejected(system):
             jnp.asarray(right_hand_side),
             matrix_type=matrix_type,
         )
+
+    with pytest.raises(NotImplementedError, match="sparsity pattern"):
+        jax.vmap(solve_one)(indices_batch, values_batch)
+
+
+# --- stateful vmap rules ---
+
+
+def _analyze_factor(indptr, indices, values):
+    """Analyze then factor, returning a ready-to-solve token."""
+    token, _ = primitive.analyze(indptr, indices, values, matrix_type=MATRIX_TYPE)
+    token, _ = primitive.factor(token, indptr, indices, values, matrix_type=MATRIX_TYPE)
+    return token
+
+
+def test_vmap_solve_stateful_over_right_hand_side(any_system):
+    """Batching RHS through solve_stateful fuses into one native call."""
+    indptr, indices, values, dense, _rhs = any_system
+    indptr, indices, values = map(jnp.asarray, (indptr, indices, values))
+    batch_size = 4
+    rhs_batch = jnp.asarray(np.random.default_rng(20).uniform(-1, 1, (batch_size, dense.shape[0])))
+
+    token = _analyze_factor(indptr, indices, values)
+
+    def solve_one(b):
+        sol, _ = primitive.solve_stateful(
+            token, indptr, indices, values, b[None, :], matrix_type=MATRIX_TYPE
+        )
+        return sol[0]
+
+    batched = jax.vmap(solve_one)(rhs_batch)
+    expected = np.linalg.solve(dense, np.asarray(rhs_batch).T).T
+    np.testing.assert_allclose(np.asarray(batched), expected, rtol=1e-8, atol=1e-10)
+
+
+def test_vmap_factor_and_solve_stateful_over_right_hand_side(any_system):
+    """Batching RHS through factor_and_solve_stateful fuses into one call."""
+    indptr, indices, values, dense, _rhs = any_system
+    indptr, indices, values = map(jnp.asarray, (indptr, indices, values))
+    batch_size = 4
+    rhs_batch = jnp.asarray(np.random.default_rng(21).uniform(-1, 1, (batch_size, dense.shape[0])))
+
+    token, _ = primitive.analyze(indptr, indices, values, matrix_type=MATRIX_TYPE)
+
+    def solve_one(b):
+        sol, _ = primitive.factor_and_solve_stateful(
+            token, indptr, indices, values, b[None, :], matrix_type=MATRIX_TYPE
+        )
+        return sol[0]
+
+    batched = jax.vmap(solve_one)(rhs_batch)
+    expected = np.linalg.solve(dense, np.asarray(rhs_batch).T).T
+    np.testing.assert_allclose(np.asarray(batched), expected, rtol=1e-8, atol=1e-10)
+
+
+def test_vmap_factor_and_solve_stateful_over_values(any_system):
+    """Batching values through factor_and_solve_stateful refactors per element."""
+    indptr, indices, values, dense, right_hand_side = any_system
+    indptr, indices, values = map(jnp.asarray, (indptr, indices, values))
+    right_hand_side = jnp.asarray(right_hand_side)
+    batch_size = 3
+    scales = np.random.default_rng(22).uniform(0.5, 2.0, size=batch_size)
+    values_batch = values[None, :] * jnp.asarray(scales)[:, None]
+
+    token, _ = primitive.analyze(indptr, indices, values, matrix_type=MATRIX_TYPE)
+
+    def solve_one(v):
+        sol, _ = primitive.factor_and_solve_stateful(
+            token, indptr, indices, v, right_hand_side[None, :], matrix_type=MATRIX_TYPE
+        )
+        return sol[0]
+
+    batched = jax.vmap(solve_one)(values_batch)
+    for i in range(batch_size):
+        scaled_dense = dense * scales[i]
+        expected = np.linalg.solve(scaled_dense, np.asarray(right_hand_side))
+        np.testing.assert_allclose(np.asarray(batched[i]), expected, rtol=1e-8, atol=1e-10)
+
+
+def test_vmap_solve_stateful_rejects_batched_values(any_system):
+    """solve_stateful rejects vmapping over values, pointing to factor_and_solve."""
+    indptr, indices, values, _dense, right_hand_side = any_system
+    indptr, indices, values = map(jnp.asarray, (indptr, indices, values))
+    values_batch = jnp.stack([values, values * 2.0])
+
+    token = _analyze_factor(indptr, indices, values)
+
+    def solve_one(v):
+        sol, _ = primitive.solve_stateful(
+            token, indptr, indices, v, jnp.asarray(right_hand_side)[None, :], matrix_type=MATRIX_TYPE
+        )
+        return sol[0]
+
+    with pytest.raises(NotImplementedError, match="factor_and_solve_stateful"):
+        jax.vmap(solve_one)(values_batch)
+
+
+def test_vmap_stateful_rejects_batched_pattern(any_system):
+    """Both stateful calls reject vmapping over sparsity pattern arrays."""
+    indptr, indices, values, _dense, right_hand_side = any_system
+    indptr, indices, values = map(jnp.asarray, (indptr, indices, values))
+    indices_batch = jnp.stack([indices, indices])
+    values_batch = jnp.stack([values, values])
+
+    token = _analyze_factor(indptr, indices, values)
+
+    def solve_one(idx, v):
+        sol, _ = primitive.solve_stateful(
+            token, indptr, idx, v, jnp.asarray(right_hand_side)[None, :], matrix_type=MATRIX_TYPE
+        )
+        return sol[0]
 
     with pytest.raises(NotImplementedError, match="sparsity pattern"):
         jax.vmap(solve_one)(indices_batch, values_batch)

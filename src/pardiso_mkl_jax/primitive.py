@@ -268,6 +268,80 @@ def factor(token, indptr, indices, values, *, matrix_type: MatrixType, options: 
     return FactorizationToken(handle_out, jnp.zeros((), jnp.int32)), final_iparm
 
 
+@functools.cache
+def _make_solve_stateful_core(
+    matrix_type: MatrixType, transpose: bool, overlay_key: tuple[tuple[int, int], ...]
+):
+    """Build a custom_vmap-decorated solve-stateful function for one
+    (matrix_type, transpose, overlay) combination.
+
+    Same closure-capture pattern as _make_solve_core: custom_vmap traces
+    every argument as an abstract value, so static args must be bound by
+    closure rather than passed in.
+    """
+
+    @jax.custom_batching.custom_vmap
+    def solve_stateful_core(token_id, indptr, indices, values, right_hand_side):
+        dimension = indptr.shape[0] - 1
+        number_of_right_hand_sides = right_hand_side.shape[0]
+        overlay_mask, overlay_values = _overlay_buffers(overlay_key)
+        return jax.ffi.ffi_call(
+            "pardiso_mkl_jax_solve",
+            (
+                jax.ShapeDtypeStruct(right_hand_side.shape, jnp.float64),
+                jax.ShapeDtypeStruct((64,), jnp.int32),
+            ),
+            has_side_effect=True,
+        )(
+            token_id,
+            indptr,
+            indices,
+            values,
+            right_hand_side,
+            overlay_mask,
+            overlay_values,
+            matrix_type=np.int64(matrix_type),
+            dimension=np.int64(dimension),
+            number_of_right_hand_sides=np.int64(number_of_right_hand_sides),
+            transpose_mode=_transpose_mode(transpose),
+        )
+
+    @solve_stateful_core.def_vmap
+    def vmap_rule(_axis_size, in_batched, token_id, indptr, indices, values, right_hand_side):
+        token_id_batched, indptr_batched, indices_batched, values_batched, rhs_batched = in_batched
+        if indptr_batched or indices_batched:
+            raise NotImplementedError(
+                "vmap over indptr or indices is not supported: every matrix in a batch must "
+                "share the same sparsity pattern. Batch over values instead."
+            )
+        if token_id_batched:
+            raise NotImplementedError("vmap over the token is not supported.")
+        if values_batched:
+            raise NotImplementedError(
+                "vmap over values is not supported for solve_stateful (phase 33 only). "
+                "Use factor_and_solve_stateful to refactor per batch element."
+            )
+
+        if rhs_batched:
+            # Fuse the batch dim into Pardiso's multi-RHS support.
+            # rhs shape is (batch, num_rhs, n), reshape to (batch*num_rhs, n)
+            # so Pardiso solves all of them in one native call.
+            original_shape = right_hand_side.shape
+            fused = right_hand_side.reshape(-1, original_shape[-1])
+            solution, final_iparm = solve_stateful_core(
+                token_id, indptr, indices, values, fused
+            )
+            solution = solution.reshape(original_shape)
+            return (solution, final_iparm), (True, False)
+
+        # Nothing batched. custom_vmap can still reach here if unrelated
+        # arguments elsewhere in a larger vmapped computation were batched.
+        result = solve_stateful_core(token_id, indptr, indices, values, right_hand_side)
+        return result, (False, False)
+
+    return solve_stateful_core
+
+
 def solve_stateful(
     token,
     indptr,
@@ -287,29 +361,88 @@ def solve_stateful(
     latter for decoding into a PardisoDiagnostics. To order a later release
     after this solve, pass the solution to token.track (see release).
     """
-    dimension = indptr.shape[0] - 1
-    number_of_right_hand_sides = right_hand_side.shape[0]
-    overlay_mask, overlay_values = _overlay_buffers(options)
-    return jax.ffi.ffi_call(
-        "pardiso_mkl_jax_solve",
-        (
-            jax.ShapeDtypeStruct(right_hand_side.shape, jnp.float64),
-            jax.ShapeDtypeStruct((64,), jnp.int32),
-        ),
-        has_side_effect=True,
-    )(
-        token.id,
-        indptr,
-        indices,
-        values,
-        right_hand_side,
-        overlay_mask,
-        overlay_values,
-        matrix_type=np.int64(matrix_type),
-        dimension=np.int64(dimension),
-        number_of_right_hand_sides=np.int64(number_of_right_hand_sides),
-        transpose_mode=_transpose_mode(transpose),
-    )
+    overlay_key = canonicalize_overlay(options)
+    core = _make_solve_stateful_core(MatrixType(matrix_type), transpose, overlay_key)
+    return core(token.id, indptr, indices, values, right_hand_side)
+
+
+@functools.cache
+def _make_factor_and_solve_stateful_core(
+    matrix_type: MatrixType, transpose: bool, overlay_key: tuple[tuple[int, int], ...]
+):
+    """Build a custom_vmap-decorated factor-and-solve function for one
+    (matrix_type, transpose, overlay) combination.
+
+    Same closure-capture pattern as _make_solve_core.
+    """
+
+    @jax.custom_batching.custom_vmap
+    def factor_and_solve_core(token_id, indptr, indices, values, right_hand_side):
+        dimension = indptr.shape[0] - 1
+        number_of_right_hand_sides = right_hand_side.shape[0]
+        overlay_mask, overlay_values = _overlay_buffers(overlay_key)
+        return jax.ffi.ffi_call(
+            "pardiso_mkl_jax_factor_solve",
+            (
+                jax.ShapeDtypeStruct(right_hand_side.shape, jnp.float64),
+                jax.ShapeDtypeStruct((64,), jnp.int32),
+            ),
+            has_side_effect=True,
+        )(
+            token_id,
+            indptr,
+            indices,
+            values,
+            right_hand_side,
+            overlay_mask,
+            overlay_values,
+            matrix_type=np.int64(matrix_type),
+            dimension=np.int64(dimension),
+            number_of_right_hand_sides=np.int64(number_of_right_hand_sides),
+            transpose_mode=_transpose_mode(transpose),
+        )
+
+    @factor_and_solve_core.def_vmap
+    def vmap_rule(axis_size, in_batched, token_id, indptr, indices, values, right_hand_side):
+        token_id_batched, indptr_batched, indices_batched, values_batched, rhs_batched = in_batched
+        if indptr_batched or indices_batched:
+            raise NotImplementedError(
+                "vmap over indptr or indices is not supported: every matrix in a batch must "
+                "share the same sparsity pattern. Batch over values instead."
+            )
+        if token_id_batched:
+            raise NotImplementedError("vmap over the token is not supported.")
+
+        if not values_batched and rhs_batched:
+            # Fuse the batch dim into Pardiso's multi-RHS support.
+            # Phase 23 factors once and solves all RHS in one native call.
+            original_shape = right_hand_side.shape
+            fused = right_hand_side.reshape(-1, original_shape[-1])
+            solution, final_iparm = factor_and_solve_core(
+                token_id, indptr, indices, values, fused
+            )
+            solution = solution.reshape(original_shape)
+            return (solution, final_iparm), (True, False)
+
+        if values_batched:
+            # Each batch element needs its own numeric factorization, but
+            # they share the analysis behind token_id. Loop and call phase
+            # 23 per element, then stack.
+            solutions = []
+            iparms = []
+            for i in range(axis_size):
+                current_rhs = right_hand_side[i] if rhs_batched else right_hand_side
+                sol, iparm = factor_and_solve_core(
+                    token_id, indptr, indices, values[i], current_rhs
+                )
+                solutions.append(sol)
+                iparms.append(iparm)
+            return (jnp.stack(solutions), jnp.stack(iparms)), (True, True)
+
+        result = factor_and_solve_core(token_id, indptr, indices, values, right_hand_side)
+        return result, (False, False)
+
+    return factor_and_solve_core
 
 
 def factor_and_solve_stateful(
@@ -328,33 +461,13 @@ def factor_and_solve_stateful(
     Runs Pardiso's combined phase 23 (numeric factorization then solve) for the
     given values against the stored analysis. This is a single FFI call, so the
     factorization and the solve stay ordered under jit, unlike a factor()
-    followed by a separate solve_stateful(): those share no data dependency XLA
+    followed by a separate solve_stateful(). Those share no data dependency XLA
     must honor, so the solve could otherwise run before the factor. Returns
     (solution, final_iparm), the latter for decoding into a PardisoDiagnostics.
     """
-    dimension = indptr.shape[0] - 1
-    number_of_right_hand_sides = right_hand_side.shape[0]
-    overlay_mask, overlay_values = _overlay_buffers(options)
-    return jax.ffi.ffi_call(
-        "pardiso_mkl_jax_factor_solve",
-        (
-            jax.ShapeDtypeStruct(right_hand_side.shape, jnp.float64),
-            jax.ShapeDtypeStruct((64,), jnp.int32),
-        ),
-        has_side_effect=True,
-    )(
-        token.id,
-        indptr,
-        indices,
-        values,
-        right_hand_side,
-        overlay_mask,
-        overlay_values,
-        matrix_type=np.int64(matrix_type),
-        dimension=np.int64(dimension),
-        number_of_right_hand_sides=np.int64(number_of_right_hand_sides),
-        transpose_mode=_transpose_mode(transpose),
-    )
+    overlay_key = canonicalize_overlay(options)
+    core = _make_factor_and_solve_stateful_core(MatrixType(matrix_type), transpose, overlay_key)
+    return core(token.id, indptr, indices, values, right_hand_side)
 
 
 def release(token, dependency=None):
