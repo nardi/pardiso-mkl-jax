@@ -16,7 +16,7 @@ requires = [
 
 [project]
 name = "pardiso-mkl-jax"
-version = "0.2.0"
+version = "0.2.1"
 description = "JAX-compatible interface to the oneMKL Pardiso direct sparse solver"
 readme = "README.md"
 license = "MIT"
