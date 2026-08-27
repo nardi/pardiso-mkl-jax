@@ -124,11 +124,9 @@ class FactorizationToken:
     it, so a release is ordered after those solves even inside a jit trace.
     """
 
-    def __init__(self, id, n_dependent_solutions=None):
+    def __init__(self, id, n_dependent_solutions):
         self.id = id
-        self.n_dependent_solutions = (
-            jnp.zeros((), jnp.int32) if n_dependent_solutions is None else n_dependent_solutions
-        )
+        self.n_dependent_solutions = n_dependent_solutions
 
     def track(self, *solutions):
         """Return a token whose release is ordered after these solutions."""
@@ -193,7 +191,7 @@ def analyze(indptr, indices, values, *, matrix_type: MatrixType, options: Option
         matrix_type=np.int64(matrix_type),
         dimension=np.int64(dimension),
     )
-    return FactorizationToken(handle), final_iparm
+    return FactorizationToken(handle, jnp.zeros((), jnp.int32)), final_iparm
 
 
 def reanalyze(
@@ -235,7 +233,7 @@ def reanalyze(
         matrix_type=np.int64(matrix_type),
         dimension=np.int64(dimension),
     )
-    return FactorizationToken(handle_out), final_iparm
+    return FactorizationToken(handle_out, jnp.zeros((), jnp.int32)), final_iparm
 
 
 def factor(token, indptr, indices, values, *, matrix_type: MatrixType, options: OptionsLike = None):
@@ -267,7 +265,7 @@ def factor(token, indptr, indices, values, *, matrix_type: MatrixType, options: 
         matrix_type=np.int64(matrix_type),
         dimension=np.int64(dimension),
     )
-    return FactorizationToken(handle_out), final_iparm
+    return FactorizationToken(handle_out, jnp.zeros((), jnp.int32)), final_iparm
 
 
 def solve_stateful(
