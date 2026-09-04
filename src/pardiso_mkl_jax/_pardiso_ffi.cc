@@ -57,6 +57,11 @@ struct PardisoState {
   MKL_INT matrix_type = 0;
   MKL_INT dimension = 0;
   long analysis_count = 0;
+  // Generation stamp for the factorization this state currently holds. Every
+  // write (analyze, reanalyze, factor, factor_and_solve) sets a fresh value
+  // from VersionCounter, and a solve carries the version it expects so the
+  // solve handler can reject a token left over from before a later write.
+  int64_t version = 0;
 };
 
 // Forces the LP64 interface layer, matching the int32 CSR indices this
@@ -85,6 +90,16 @@ std::unordered_map<int64_t, PardisoState>& Registry() {
 // so two concurrent or repeated invocations of a compiled function each get
 // their own registry entry instead of colliding on a trace-time id.
 std::atomic<int64_t>& HandleCounter() {
+  static std::atomic<int64_t> counter{1};
+  return counter;
+}
+
+// Monotonic source of factorization version stamps, never reused. Every write
+// takes a fresh value and stores it on its state, and a solve checks the
+// version it was given against the state's current one. Because the counter
+// only ever goes up, a token from before a later write always compares
+// unequal, which is how a stale token is caught. See PardisoState::version.
+std::atomic<int64_t>& VersionCounter() {
   static std::atomic<int64_t> counter{1};
   return counter;
 }
@@ -314,6 +329,7 @@ ffi::Error PardisoAnalyzeImpl(int64_t matrix_type, int64_t dimension,
                                ffi::Buffer<ffi::F64> values, ffi::Buffer<ffi::S32> options_mask,
                                ffi::Buffer<ffi::S32> options_values,
                                ffi::ResultBuffer<ffi::S64> handle_out,
+                               ffi::ResultBuffer<ffi::S64> version_out,
                                ffi::ResultBuffer<ffi::S32> status,
                                ffi::ResultBuffer<ffi::S32> final_iparm) {
   int64_t handle = HandleCounter().fetch_add(1);
@@ -322,6 +338,7 @@ ffi::Error PardisoAnalyzeImpl(int64_t matrix_type, int64_t dimension,
   PardisoState& state = Registry()[handle];
   state.matrix_type = static_cast<MKL_INT>(matrix_type);
   state.dimension = static_cast<MKL_INT>(dimension);
+  state.version = VersionCounter().fetch_add(1);
   InitializeIparm(state.iparm, state.matrix_type);
   ApplyOverlay(state.iparm, options_mask.typed_data(), options_values.typed_data());
 
@@ -342,6 +359,7 @@ ffi::Error PardisoAnalyzeImpl(int64_t matrix_type, int64_t dimension,
   TouchLru(handle);
   EvictIfNeeded();
   handle_out->typed_data()[0] = handle;
+  version_out->typed_data()[0] = state.version;
   std::memcpy(final_iparm->typed_data(), state.iparm, sizeof(MKL_INT) * 64);
   status->typed_data()[0] = static_cast<int32_t>(error);
   if (error != 0) {
@@ -366,6 +384,7 @@ ffi::Error PardisoReanalyzeImpl(int64_t matrix_type, int64_t dimension,
                                  ffi::Buffer<ffi::S32> options_mask,
                                  ffi::Buffer<ffi::S32> options_values,
                                  ffi::ResultBuffer<ffi::S64> handle_out,
+                                 ffi::ResultBuffer<ffi::S64> version_out,
                                  ffi::ResultBuffer<ffi::S32> status,
                                  ffi::ResultBuffer<ffi::S32> final_iparm) {
   int64_t handle = handle_in.typed_data()[0];
@@ -375,6 +394,7 @@ ffi::Error PardisoReanalyzeImpl(int64_t matrix_type, int64_t dimension,
   // uninitialized and leaving them that way is a trap for anyone who later
   // makes a failure path non-fatal.
   handle_out->typed_data()[0] = handle;
+  version_out->typed_data()[0] = 0;
   std::memset(final_iparm->typed_data(), 0, sizeof(int32_t) * 64);
 
   std::lock_guard<std::mutex> lock(RegistryMutex());
@@ -419,6 +439,7 @@ ffi::Error PardisoReanalyzeImpl(int64_t matrix_type, int64_t dimension,
   std::memset(state.handle, 0, sizeof(state.handle));
   state.matrix_type = static_cast<MKL_INT>(matrix_type);
   state.dimension = static_cast<MKL_INT>(dimension);
+  state.version = VersionCounter().fetch_add(1);
   InitializeIparm(state.iparm, state.matrix_type);
   ApplyOverlay(state.iparm, options_mask.typed_data(), options_values.typed_data());
 
@@ -434,6 +455,7 @@ ffi::Error PardisoReanalyzeImpl(int64_t matrix_type, int64_t dimension,
   TouchLru(handle);
   EvictIfNeeded();
   handle_out->typed_data()[0] = handle;
+  version_out->typed_data()[0] = state.version;
   std::memcpy(final_iparm->typed_data(), state.iparm, sizeof(MKL_INT) * 64);
   status->typed_data()[0] = static_cast<int32_t>(error);
   if (error != 0) {
@@ -452,6 +474,7 @@ ffi::Error PardisoFactorImpl(int64_t matrix_type, int64_t dimension,
                               ffi::Buffer<ffi::S32> options_mask,
                               ffi::Buffer<ffi::S32> options_values,
                               ffi::ResultBuffer<ffi::S64> handle_out,
+                              ffi::ResultBuffer<ffi::S64> version_out,
                               ffi::ResultBuffer<ffi::S32> status,
                               ffi::ResultBuffer<ffi::S32> final_iparm) {
   int64_t handle = handle_in.typed_data()[0];
@@ -459,6 +482,7 @@ ffi::Error PardisoFactorImpl(int64_t matrix_type, int64_t dimension,
   std::lock_guard<std::mutex> lock(RegistryMutex());
   bool missing = Registry().find(handle) == Registry().end();
   handle_out->typed_data()[0] = handle;
+  version_out->typed_data()[0] = 0;
   // A missing handle lost its analysis to eviction or release. We rebuild it
   // below from the matrix this call carries. Strict mode reports it instead.
   if (missing && StrictCache()) {
@@ -471,6 +495,9 @@ ffi::Error PardisoFactorImpl(int64_t matrix_type, int64_t dimension,
   PardisoState& state = Registry()[handle];
   state.matrix_type = static_cast<MKL_INT>(matrix_type);
   state.dimension = static_cast<MKL_INT>(dimension);
+  // A numeric factorization always replaces whatever the state held, so it
+  // takes a fresh version stamp regardless of the token that came in.
+  state.version = VersionCounter().fetch_add(1);
   InitializeIparm(state.iparm, state.matrix_type);
   ApplyOverlay(state.iparm, options_mask.typed_data(), options_values.typed_data());
 
@@ -499,6 +526,7 @@ ffi::Error PardisoFactorImpl(int64_t matrix_type, int64_t dimension,
 
   TouchLru(handle);
   EvictIfNeeded();
+  version_out->typed_data()[0] = state.version;
   std::memcpy(final_iparm->typed_data(), state.iparm, sizeof(MKL_INT) * 64);
   status->typed_data()[0] = static_cast<int32_t>(error);
   if (error != 0) {
@@ -516,14 +544,25 @@ ffi::Error PardisoFactorImpl(int64_t matrix_type, int64_t dimension,
 // order, with no need to refactorize.
 ffi::Error PardisoSolveImpl(int64_t matrix_type, int64_t dimension,
                              int64_t number_of_right_hand_sides, int64_t transpose_mode,
-                             ffi::Buffer<ffi::S64> handle_in, ffi::Buffer<ffi::S32> indptr,
+                             ffi::Buffer<ffi::S64> handle_in, ffi::Buffer<ffi::S64> version_in,
+                             ffi::Buffer<ffi::S32> indptr,
                              ffi::Buffer<ffi::S32> indices, ffi::Buffer<ffi::F64> values,
                              ffi::Buffer<ffi::F64> right_hand_side,
                              ffi::Buffer<ffi::S32> options_mask,
                              ffi::Buffer<ffi::S32> options_values,
                              ffi::ResultBuffer<ffi::F64> solution,
+                             ffi::ResultBuffer<ffi::S64> handle_out,
+                             ffi::ResultBuffer<ffi::S64> version_out,
                              ffi::ResultBuffer<ffi::S32> final_iparm) {
   int64_t handle = handle_in.typed_data()[0];
+  int64_t version = version_in.typed_data()[0];
+
+  // The solve echoes the handle and version so a later call that consumes
+  // this token is ordered after the solve by data dependency, which is what
+  // keeps a reused factorization from being overwritten before this solve
+  // reads it. See primitive.solve_stateful.
+  handle_out->typed_data()[0] = handle;
+  version_out->typed_data()[0] = version;
 
   std::lock_guard<std::mutex> lock(RegistryMutex());
   bool missing = Registry().find(handle) == Registry().end();
@@ -538,6 +577,20 @@ ffi::Error PardisoSolveImpl(int64_t matrix_type, int64_t dimension,
   }
 
   PardisoState& state = Registry()[handle];
+  // A present handle whose version has moved past the one this token expects
+  // means a later write already replaced the factorization, so solving now
+  // would return the wrong matrix's answer. Reject it rather than solve. A
+  // missing handle is the self-healing rebuild path below, which adopts the
+  // token's version, so this check only fires on a live state.
+  if (!missing && state.version != version) {
+    std::memset(solution->typed_data(), 0, solution->element_count() * sizeof(double));
+    std::memset(final_iparm->typed_data(), 0, sizeof(int32_t) * 64);
+    return ffi::Error::Internal("pardiso solve: token version " + std::to_string(version) +
+                                " does not match the factorization now held for handle " +
+                                std::to_string(handle) + " (version " +
+                                std::to_string(state.version) +
+                                "); it was replaced by a later factor or reanalyze");
+  }
   state.matrix_type = static_cast<MKL_INT>(matrix_type);
   state.dimension = static_cast<MKL_INT>(dimension);
   InitializeIparm(state.iparm, state.matrix_type);
@@ -552,6 +605,9 @@ ffi::Error PardisoSolveImpl(int64_t matrix_type, int64_t dimension,
 
   if (missing) {
     RebuildCounter().fetch_add(1);
+    // The rebuilt factorization stands in for the one the token named, so it
+    // takes the token's version rather than a fresh stamp.
+    state.version = version;
     MKL_INT rebuild_error =
         RunAnalysis(state, indptr.typed_data(), indices.typed_data(), values.typed_data());
     if (rebuild_error == 0) {
@@ -591,16 +647,31 @@ ffi::Error PardisoSolveImpl(int64_t matrix_type, int64_t dimension,
 // carries the ordering, since it also collapses two native calls that touch
 // the same registry entry into one. The analysis (phase 11) is not
 // repeated, so analysis_count is left untouched.
+//
+// The version is passed through unchanged, not bumped the way a plain factor
+// bumps it. This call replaces the numeric factorization and reads it back in
+// the same step, so the token that named it stays the one that names the
+// result, which is what lets PardisoSolver keep using its stored token after
+// a refactor_and_solve without having to restamp it under jit.
 ffi::Error PardisoFactorSolveImpl(int64_t matrix_type, int64_t dimension,
                                    int64_t number_of_right_hand_sides, int64_t transpose_mode,
-                                   ffi::Buffer<ffi::S64> handle_in, ffi::Buffer<ffi::S32> indptr,
+                                   ffi::Buffer<ffi::S64> handle_in, ffi::Buffer<ffi::S64> version_in,
+                                   ffi::Buffer<ffi::S32> indptr,
                                    ffi::Buffer<ffi::S32> indices, ffi::Buffer<ffi::F64> values,
                                    ffi::Buffer<ffi::F64> right_hand_side,
                                    ffi::Buffer<ffi::S32> options_mask,
                                    ffi::Buffer<ffi::S32> options_values,
                                    ffi::ResultBuffer<ffi::F64> solution,
+                                   ffi::ResultBuffer<ffi::S64> handle_out,
+                                   ffi::ResultBuffer<ffi::S64> version_out,
                                    ffi::ResultBuffer<ffi::S32> final_iparm) {
   int64_t handle = handle_in.typed_data()[0];
+  int64_t version = version_in.typed_data()[0];
+
+  // Echoed so a later call that consumes this token is ordered after the
+  // combined factor-and-solve, the same threading the plain solve does.
+  handle_out->typed_data()[0] = handle;
+  version_out->typed_data()[0] = version;
 
   std::lock_guard<std::mutex> lock(RegistryMutex());
   bool missing = Registry().find(handle) == Registry().end();
@@ -617,6 +688,9 @@ ffi::Error PardisoFactorSolveImpl(int64_t matrix_type, int64_t dimension,
   PardisoState& state = Registry()[handle];
   state.matrix_type = static_cast<MKL_INT>(matrix_type);
   state.dimension = static_cast<MKL_INT>(dimension);
+  // Keep the state's version equal to the token's, so a later solve on this
+  // same token still matches.
+  state.version = version;
   InitializeIparm(state.iparm, state.matrix_type);
   ApplyOverlay(state.iparm, options_mask.typed_data(), options_values.typed_data());
   // Set unconditionally, matching PardisoSolveImpl, so a later call without
@@ -755,6 +829,7 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(kPardisoAnalyzeHandler, PardisoAnalyzeImpl,
                                    .Arg<ffi::Buffer<ffi::S32>>()  // options_mask
                                    .Arg<ffi::Buffer<ffi::S32>>()  // options_values
                                    .Ret<ffi::Buffer<ffi::S64>>()  // handle
+                                   .Ret<ffi::Buffer<ffi::S64>>()  // version
                                    .Ret<ffi::Buffer<ffi::S32>>()  // status
                                    .Ret<ffi::Buffer<ffi::S32>>()  // final_iparm
 );
@@ -770,6 +845,7 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(kPardisoReanalyzeHandler, PardisoReanalyzeImpl,
                                    .Arg<ffi::Buffer<ffi::S32>>()  // options_mask
                                    .Arg<ffi::Buffer<ffi::S32>>()  // options_values
                                    .Ret<ffi::Buffer<ffi::S64>>()  // handle
+                                   .Ret<ffi::Buffer<ffi::S64>>()  // version
                                    .Ret<ffi::Buffer<ffi::S32>>()  // status
                                    .Ret<ffi::Buffer<ffi::S32>>()  // final_iparm
 );
@@ -785,6 +861,7 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(kPardisoFactorHandler, PardisoFactorImpl,
                                    .Arg<ffi::Buffer<ffi::S32>>()  // options_mask
                                    .Arg<ffi::Buffer<ffi::S32>>()  // options_values
                                    .Ret<ffi::Buffer<ffi::S64>>()  // handle
+                                   .Ret<ffi::Buffer<ffi::S64>>()  // version
                                    .Ret<ffi::Buffer<ffi::S32>>()  // status
                                    .Ret<ffi::Buffer<ffi::S32>>()  // final_iparm
 );
@@ -796,6 +873,7 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(kPardisoSolveHandler, PardisoSolveImpl,
                                    .Attr<int64_t>("number_of_right_hand_sides")
                                    .Attr<int64_t>("transpose_mode")
                                    .Arg<ffi::Buffer<ffi::S64>>()  // handle
+                                   .Arg<ffi::Buffer<ffi::S64>>()  // version
                                    .Arg<ffi::Buffer<ffi::S32>>()  // indptr
                                    .Arg<ffi::Buffer<ffi::S32>>()  // indices
                                    .Arg<ffi::Buffer<ffi::F64>>()  // values
@@ -803,6 +881,8 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(kPardisoSolveHandler, PardisoSolveImpl,
                                    .Arg<ffi::Buffer<ffi::S32>>()  // options_mask
                                    .Arg<ffi::Buffer<ffi::S32>>()  // options_values
                                    .Ret<ffi::Buffer<ffi::F64>>()  // solution
+                                   .Ret<ffi::Buffer<ffi::S64>>()  // handle
+                                   .Ret<ffi::Buffer<ffi::S64>>()  // version
                                    .Ret<ffi::Buffer<ffi::S32>>()  // final_iparm
 );
 
@@ -813,6 +893,7 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(kPardisoFactorSolveHandler, PardisoFactorSolveImpl
                                    .Attr<int64_t>("number_of_right_hand_sides")
                                    .Attr<int64_t>("transpose_mode")
                                    .Arg<ffi::Buffer<ffi::S64>>()  // handle
+                                   .Arg<ffi::Buffer<ffi::S64>>()  // version
                                    .Arg<ffi::Buffer<ffi::S32>>()  // indptr
                                    .Arg<ffi::Buffer<ffi::S32>>()  // indices
                                    .Arg<ffi::Buffer<ffi::F64>>()  // values
@@ -820,6 +901,8 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(kPardisoFactorSolveHandler, PardisoFactorSolveImpl
                                    .Arg<ffi::Buffer<ffi::S32>>()  // options_mask
                                    .Arg<ffi::Buffer<ffi::S32>>()  // options_values
                                    .Ret<ffi::Buffer<ffi::F64>>()  // solution
+                                   .Ret<ffi::Buffer<ffi::S64>>()  // handle
+                                   .Ret<ffi::Buffer<ffi::S64>>()  // version
                                    .Ret<ffi::Buffer<ffi::S32>>()  // final_iparm
 );
 

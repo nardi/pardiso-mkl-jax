@@ -118,14 +118,19 @@ def _ordering_witness(solution):
 
 @jax.tree_util.register_pytree_node_class
 class FactorizationToken:
-    """Handle to a native factorization: a cache id plus a solve counter.
+    """Handle to a native factorization: a cache id, a version, and a solve counter.
 
+    id is the key into the native cache. version is a generation stamp the
+    native layer sets on every factor or reanalyze and passes through unchanged
+    on a solve, so a solve can tell whether the handle still holds the
+    factorization the token names, and rejects the call otherwise.
     n_dependent_solutions counts the solutions passed to track. release consumes
     it, so a release is ordered after those solves even inside a jit trace.
     """
 
-    def __init__(self, id, n_dependent_solutions):
+    def __init__(self, id, version, n_dependent_solutions):
         self.id = id
+        self.version = version
         self.n_dependent_solutions = n_dependent_solutions
 
     def track(self, *solutions):
@@ -133,10 +138,10 @@ class FactorizationToken:
         count = self.n_dependent_solutions
         for solution in solutions:
             count = count + jnp.int32(1) + _ordering_witness(solution)
-        return FactorizationToken(self.id, count)
+        return FactorizationToken(self.id, self.version, count)
 
     def tree_flatten(self):
-        return (self.id, self.n_dependent_solutions), None
+        return (self.id, self.version, self.n_dependent_solutions), None
 
     @classmethod
     def tree_unflatten(cls, aux_data, children):
@@ -160,8 +165,9 @@ def analyze(indptr, indices, values, *, matrix_type: MatrixType, options: Option
     """Run the analyze (phase 11) step and allocate a fresh native factorization.
 
     Returns (token, final_iparm). The token is a FactorizationToken carrying
-    the native factorization's cache id, which every later call (factor,
-    solve_stateful, factor_and_solve_stateful, release) takes as an input.
+    the native factorization's cache id and its version stamp, which every
+    later call (factor, solve_stateful, factor_and_solve_stateful, release)
+    takes as an input.
     Threading the id as data, rather than addressing the native state by
     a Python-side id, is what lets XLA order the whole
     analyze-factor-solve-release lifecycle and lets it run inside a jitted
@@ -174,9 +180,10 @@ def analyze(indptr, indices, values, *, matrix_type: MatrixType, options: Option
     """
     dimension = indptr.shape[0] - 1
     overlay_mask, overlay_values = _overlay_buffers(options)
-    handle, _status, final_iparm = jax.ffi.ffi_call(
+    handle, version, _status, final_iparm = jax.ffi.ffi_call(
         "pardiso_mkl_jax_analyze",
         (
+            jax.ShapeDtypeStruct((), jnp.int64),
             jax.ShapeDtypeStruct((), jnp.int64),
             jax.ShapeDtypeStruct((), jnp.int32),
             jax.ShapeDtypeStruct((64,), jnp.int32),
@@ -191,7 +198,7 @@ def analyze(indptr, indices, values, *, matrix_type: MatrixType, options: Option
         matrix_type=np.int64(matrix_type),
         dimension=np.int64(dimension),
     )
-    return FactorizationToken(handle, jnp.zeros((), jnp.int32)), final_iparm
+    return FactorizationToken(handle, version, jnp.zeros((), jnp.int32)), final_iparm
 
 
 def reanalyze(
@@ -205,7 +212,8 @@ def reanalyze(
     values, or a different overlay) without ending up holding two ids.
     Returns (token, final_iparm) with the id unchanged, which keeps later
     calls ordered against it by data dependency exactly as factor does. The
-    returned token's solve counter is reset to zero.
+    returned token carries a fresh version stamp and its solve counter is reset
+    to zero.
 
     The numeric factorization is gone afterwards, so factor must run again
     before any solve. If the id was evicted or released, this rebuilds it
@@ -215,9 +223,10 @@ def reanalyze(
     """
     dimension = indptr.shape[0] - 1
     overlay_mask, overlay_values = _overlay_buffers(options)
-    handle_out, _status, final_iparm = jax.ffi.ffi_call(
+    handle_out, version_out, _status, final_iparm = jax.ffi.ffi_call(
         "pardiso_mkl_jax_reanalyze",
         (
+            jax.ShapeDtypeStruct((), jnp.int64),
             jax.ShapeDtypeStruct((), jnp.int64),
             jax.ShapeDtypeStruct((), jnp.int32),
             jax.ShapeDtypeStruct((64,), jnp.int32),
@@ -233,7 +242,7 @@ def reanalyze(
         matrix_type=np.int64(matrix_type),
         dimension=np.int64(dimension),
     )
-    return FactorizationToken(handle_out, jnp.zeros((), jnp.int32)), final_iparm
+    return FactorizationToken(handle_out, version_out, jnp.zeros((), jnp.int32)), final_iparm
 
 
 def factor(token, indptr, indices, values, *, matrix_type: MatrixType, options: OptionsLike = None):
@@ -241,15 +250,17 @@ def factor(token, indptr, indices, values, *, matrix_type: MatrixType, options: 
 
     Returns (token, final_iparm). The id comes back unchanged, so a
     later call that consumes this function's returned token is ordered after
-    the factorization it performed. The returned token's solve counter is
+    the factorization it performed. The returned token carries a fresh version
+    stamp, since this call replaced the factorization, and its solve counter is
     reset to zero. final_iparm is the complete iparm array as Pardiso left it,
     for decoding into a PardisoDiagnostics.
     """
     dimension = indptr.shape[0] - 1
     overlay_mask, overlay_values = _overlay_buffers(options)
-    handle_out, _status, final_iparm = jax.ffi.ffi_call(
+    handle_out, version_out, _status, final_iparm = jax.ffi.ffi_call(
         "pardiso_mkl_jax_factor",
         (
+            jax.ShapeDtypeStruct((), jnp.int64),
             jax.ShapeDtypeStruct((), jnp.int64),
             jax.ShapeDtypeStruct((), jnp.int32),
             jax.ShapeDtypeStruct((64,), jnp.int32),
@@ -265,7 +276,7 @@ def factor(token, indptr, indices, values, *, matrix_type: MatrixType, options: 
         matrix_type=np.int64(matrix_type),
         dimension=np.int64(dimension),
     )
-    return FactorizationToken(handle_out, jnp.zeros((), jnp.int32)), final_iparm
+    return FactorizationToken(handle_out, version_out, jnp.zeros((), jnp.int32)), final_iparm
 
 
 @functools.cache
@@ -281,7 +292,7 @@ def _make_solve_stateful_core(
     """
 
     @jax.custom_batching.custom_vmap
-    def solve_stateful_core(token_id, indptr, indices, values, right_hand_side):
+    def solve_stateful_core(token_id, version, indptr, indices, values, right_hand_side):
         dimension = indptr.shape[0] - 1
         number_of_right_hand_sides = right_hand_side.shape[0]
         overlay_mask, overlay_values = _overlay_buffers(overlay_key)
@@ -289,11 +300,14 @@ def _make_solve_stateful_core(
             "pardiso_mkl_jax_solve",
             (
                 jax.ShapeDtypeStruct(right_hand_side.shape, jnp.float64),
+                jax.ShapeDtypeStruct((), jnp.int64),
+                jax.ShapeDtypeStruct((), jnp.int64),
                 jax.ShapeDtypeStruct((64,), jnp.int32),
             ),
             has_side_effect=True,
         )(
             token_id,
+            version,
             indptr,
             indices,
             values,
@@ -307,14 +321,23 @@ def _make_solve_stateful_core(
         )
 
     @solve_stateful_core.def_vmap
-    def vmap_rule(_axis_size, in_batched, token_id, indptr, indices, values, right_hand_side):
-        token_id_batched, indptr_batched, indices_batched, values_batched, rhs_batched = in_batched
+    def vmap_rule(
+        _axis_size, in_batched, token_id, version, indptr, indices, values, right_hand_side
+    ):
+        (
+            token_id_batched,
+            version_batched,
+            indptr_batched,
+            indices_batched,
+            values_batched,
+            rhs_batched,
+        ) = in_batched
         if indptr_batched or indices_batched:
             raise NotImplementedError(
                 "vmap over indptr or indices is not supported: every matrix in a batch must "
                 "share the same sparsity pattern. Batch over values instead."
             )
-        if token_id_batched:
+        if token_id_batched or version_batched:
             raise NotImplementedError("vmap over the token is not supported.")
         if values_batched:
             raise NotImplementedError(
@@ -322,22 +345,24 @@ def _make_solve_stateful_core(
                 "Use factor_and_solve_stateful to refactor per batch element."
             )
 
+        # The handle and version outputs are scalars the native call echoes, so
+        # they never come back batched.
         if rhs_batched:
             # Fuse the batch dim into Pardiso's multi-RHS support.
             # rhs shape is (batch, num_rhs, n), reshape to (batch*num_rhs, n)
             # so Pardiso solves all of them in one native call.
             original_shape = right_hand_side.shape
             fused = right_hand_side.reshape(-1, original_shape[-1])
-            solution, final_iparm = solve_stateful_core(
-                token_id, indptr, indices, values, fused
+            solution, handle_out, version_out, final_iparm = solve_stateful_core(
+                token_id, version, indptr, indices, values, fused
             )
             solution = solution.reshape(original_shape)
-            return (solution, final_iparm), (True, False)
+            return (solution, handle_out, version_out, final_iparm), (True, False, False, False)
 
         # Nothing batched. custom_vmap can still reach here if unrelated
         # arguments elsewhere in a larger vmapped computation were batched.
-        result = solve_stateful_core(token_id, indptr, indices, values, right_hand_side)
-        return result, (False, False)
+        result = solve_stateful_core(token_id, version, indptr, indices, values, right_hand_side)
+        return result, (False, False, False, False)
 
     return solve_stateful_core
 
@@ -352,18 +377,34 @@ def solve_stateful(
     matrix_type: MatrixType,
     transpose: bool = False,
     options: OptionsLike = None,
+    return_token: bool = False,
 ):
     """Solve (phase 33) against the factorization already produced for token.
 
     transpose solves A^T x = right_hand_side instead of A x = right_hand_side,
     reusing the same factorization. No call to factor() is needed to switch
-    between the two for a given token. Returns (solution, final_iparm), the
-    latter for decoding into a PardisoDiagnostics. To order a later release
-    after this solve, pass the solution to token.track (see release).
+    between the two for a given token.
+
+    Returns (solution, final_iparm) by default, the second for decoding into a
+    PardisoDiagnostics. With return_token set it returns
+    (solution, token, final_iparm) instead, where the token is a distinct value
+    the native solve produced. Threading that token into a later call gives
+    that call a data dependency on this solve, which is what stops a later
+    factor from overwriting the factorization before this solve reads it. See
+    the advanced-usage guide on reusing one handle across ordered solves.
+
+    To order a later release after this solve, thread the returned token, or
+    pass the solution to token.track (see release).
     """
     overlay_key = canonicalize_overlay(options)
     core = _make_solve_stateful_core(MatrixType(matrix_type), transpose, overlay_key)
-    return core(token.id, indptr, indices, values, right_hand_side)
+    solution, handle_out, version_out, final_iparm = core(
+        token.id, token.version, indptr, indices, values, right_hand_side
+    )
+    if return_token:
+        threaded = FactorizationToken(handle_out, version_out, token.n_dependent_solutions)
+        return solution, threaded, final_iparm
+    return solution, final_iparm
 
 
 @functools.cache
@@ -377,7 +418,7 @@ def _make_factor_and_solve_stateful_core(
     """
 
     @jax.custom_batching.custom_vmap
-    def factor_and_solve_core(token_id, indptr, indices, values, right_hand_side):
+    def factor_and_solve_core(token_id, version, indptr, indices, values, right_hand_side):
         dimension = indptr.shape[0] - 1
         number_of_right_hand_sides = right_hand_side.shape[0]
         overlay_mask, overlay_values = _overlay_buffers(overlay_key)
@@ -385,11 +426,14 @@ def _make_factor_and_solve_stateful_core(
             "pardiso_mkl_jax_factor_solve",
             (
                 jax.ShapeDtypeStruct(right_hand_side.shape, jnp.float64),
+                jax.ShapeDtypeStruct((), jnp.int64),
+                jax.ShapeDtypeStruct((), jnp.int64),
                 jax.ShapeDtypeStruct((64,), jnp.int32),
             ),
             has_side_effect=True,
         )(
             token_id,
+            version,
             indptr,
             indices,
             values,
@@ -403,14 +447,23 @@ def _make_factor_and_solve_stateful_core(
         )
 
     @factor_and_solve_core.def_vmap
-    def vmap_rule(axis_size, in_batched, token_id, indptr, indices, values, right_hand_side):
-        token_id_batched, indptr_batched, indices_batched, values_batched, rhs_batched = in_batched
+    def vmap_rule(
+        axis_size, in_batched, token_id, version, indptr, indices, values, right_hand_side
+    ):
+        (
+            token_id_batched,
+            version_batched,
+            indptr_batched,
+            indices_batched,
+            values_batched,
+            rhs_batched,
+        ) = in_batched
         if indptr_batched or indices_batched:
             raise NotImplementedError(
                 "vmap over indptr or indices is not supported: every matrix in a batch must "
                 "share the same sparsity pattern. Batch over values instead."
             )
-        if token_id_batched:
+        if token_id_batched or version_batched:
             raise NotImplementedError("vmap over the token is not supported.")
 
         if not values_batched and rhs_batched:
@@ -418,29 +471,33 @@ def _make_factor_and_solve_stateful_core(
             # Phase 23 factors once and solves all RHS in one native call.
             original_shape = right_hand_side.shape
             fused = right_hand_side.reshape(-1, original_shape[-1])
-            solution, final_iparm = factor_and_solve_core(
-                token_id, indptr, indices, values, fused
+            solution, handle_out, version_out, final_iparm = factor_and_solve_core(
+                token_id, version, indptr, indices, values, fused
             )
             solution = solution.reshape(original_shape)
-            return (solution, final_iparm), (True, False)
+            return (solution, handle_out, version_out, final_iparm), (True, False, False, False)
 
         if values_batched:
             # Each batch element needs its own numeric factorization, but
             # they share the analysis behind token_id. Loop and call phase
-            # 23 per element, then stack.
+            # 23 per element, then stack. The handle and version are echoed
+            # unchanged, so they come back the same for every element and stay
+            # unbatched.
             solutions = []
             iparms = []
+            handle_out = version_out = None
             for i in range(axis_size):
                 current_rhs = right_hand_side[i] if rhs_batched else right_hand_side
-                sol, iparm = factor_and_solve_core(
-                    token_id, indptr, indices, values[i], current_rhs
+                sol, handle_out, version_out, iparm = factor_and_solve_core(
+                    token_id, version, indptr, indices, values[i], current_rhs
                 )
                 solutions.append(sol)
                 iparms.append(iparm)
-            return (jnp.stack(solutions), jnp.stack(iparms)), (True, True)
+            stacked = (jnp.stack(solutions), handle_out, version_out, jnp.stack(iparms))
+            return stacked, (True, False, False, True)
 
-        result = factor_and_solve_core(token_id, indptr, indices, values, right_hand_side)
-        return result, (False, False)
+        result = factor_and_solve_core(token_id, version, indptr, indices, values, right_hand_side)
+        return result, (False, False, False, False)
 
     return factor_and_solve_core
 
@@ -455,6 +512,7 @@ def factor_and_solve_stateful(
     matrix_type: MatrixType,
     transpose: bool = False,
     options: OptionsLike = None,
+    return_token: bool = False,
 ):
     """Refactor and solve in one call, reusing the analysis produced for token.
 
@@ -462,12 +520,23 @@ def factor_and_solve_stateful(
     given values against the stored analysis. This is a single FFI call, so the
     factorization and the solve stay ordered under jit, unlike a factor()
     followed by a separate solve_stateful(). Those share no data dependency XLA
-    must honor, so the solve could otherwise run before the factor. Returns
-    (solution, final_iparm), the latter for decoding into a PardisoDiagnostics.
+    must honor, so the solve could otherwise run before the factor.
+
+    Returns (solution, final_iparm) by default. With return_token set it returns
+    (solution, token, final_iparm), where the token carries the new version this
+    call's factorization was stamped with. Because this call both writes and
+    reads the factorization, threading that token into later calls is what keeps
+    them ordered against it, the same as with solve_stateful.
     """
     overlay_key = canonicalize_overlay(options)
     core = _make_factor_and_solve_stateful_core(MatrixType(matrix_type), transpose, overlay_key)
-    return core(token.id, indptr, indices, values, right_hand_side)
+    solution, handle_out, version_out, final_iparm = core(
+        token.id, token.version, indptr, indices, values, right_hand_side
+    )
+    if return_token:
+        threaded = FactorizationToken(handle_out, version_out, token.n_dependent_solutions)
+        return solution, threaded, final_iparm
+    return solution, final_iparm
 
 
 def release(token, dependency=None):

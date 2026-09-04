@@ -114,8 +114,8 @@ orders the re-analysis against the calls around it by data dependency.
 ## Composing inside jax.jit
 
 A `PardisoSolver`'s factorization is identified by a token, a small bundle
-carrying an `int64` cache id, threaded through `analyze`, `factor`, `solve`, and
-`release` under the hood. Once a solver has
+carrying an `int64` cache id and a version stamp, threaded through `analyze`,
+`factor`, `solve`, and `release` under the hood. Once a solver has
 been analyzed, `refactor_and_solve` and `solve` can be called any number of
 times entirely inside a jitted function, with the analysis reused across
 calls:
@@ -161,8 +161,12 @@ below.
 [`pardiso_mkl_jax.primitive`][pardiso_mkl_jax.primitive]: `analyze`,
 `reanalyze`, `factor`, `solve_stateful`, `factor_and_solve_stateful`, and
 `release`. Each one takes a
-[`FactorizationToken`][pardiso_mkl_jax.FactorizationToken] and, except for
-`solve_stateful`, `factor_and_solve_stateful`, and `release`, returns one. Library authors
+[`FactorizationToken`][pardiso_mkl_jax.FactorizationToken]. `analyze`,
+`reanalyze`, and `factor` return one. `solve_stateful` and
+`factor_and_solve_stateful` return one too when passed `return_token=True`,
+which matters for ordering reused solves and is covered in
+[Reusing one handle across ordered solves](#reusing-one-handle-across-ordered-solves)
+below. Library authors
 who want to manage a factorization's lifetime
 explicitly, rather than through `PardisoSolver`'s own context manager, for
 example tying it to a scope object or to another jit-traced dependency, can
@@ -201,6 +205,69 @@ Releasing a token that something else still uses is safe for correctness.
 early release actually frees anything is a separate question, covered in
 [When is it safe to release explicitly?](#when-is-it-safe-to-release-explicitly)
 below.
+
+## Reusing one handle across ordered solves
+
+A handle holds one factorization at a time. `solve_stateful` reads it and
+`factor` replaces it, and by default a solve returns only its solution, so a
+later `factor` shares no value with the solve before it. Under `jit`, XLA is
+free to run that `factor` before the solve that still needs the earlier
+factorization, and the solve then returns the wrong answer.
+
+Passing `return_token=True` to `solve_stateful` (and to
+`factor_and_solve_stateful`) fixes this. The solve then returns a token whose id
+and version come out of the native call, so threading that token into the next
+`factor` gives the `factor` a data dependency on the solve. Every access to the
+handle sits on one chain, and the compiler cannot reorder them:
+
+```python
+import jax
+
+jax.config.update("jax_enable_x64", True)
+
+import jax.numpy as jnp
+import pardiso_mkl_jax as pmj
+from pardiso_mkl_jax import primitive
+
+indptr = jnp.array([0, 2, 3, 4], dtype=jnp.int32)
+indices = jnp.array([0, 1, 1, 2], dtype=jnp.int32)
+values = jnp.array([4.0, 1.0, 3.0, 2.0], dtype=jnp.float64)
+other_values = values * 2.0
+right_hand_side = jnp.array([1.0, 2.0, 3.0], dtype=jnp.float64)
+matrix_type = pmj.MatrixType.REAL_NONSYMMETRIC
+
+
+@jax.jit
+def solve_both(values, other_values, right_hand_side):
+    token, _ = primitive.analyze(indptr, indices, values, matrix_type=matrix_type)
+    token, _ = primitive.factor(token, indptr, indices, values, matrix_type=matrix_type)
+    first, token, _ = primitive.solve_stateful(
+        token, indptr, indices, values, right_hand_side[None, :],
+        matrix_type=matrix_type, return_token=True,
+    )
+    # This factor consumes the token the solve returned, so it waits for the
+    # solve rather than overwriting the factorization first.
+    token, _ = primitive.factor(token, indptr, indices, other_values, matrix_type=matrix_type)
+    second, token, _ = primitive.solve_stateful(
+        token, indptr, indices, other_values, right_hand_side[None, :],
+        matrix_type=matrix_type, return_token=True,
+    )
+    primitive.release(token.track(first, second))
+    return first[0], second[0]
+
+
+first, second = solve_both(values, other_values, right_hand_side)
+```
+
+The token's version stamp is a second, independent guard. Every `factor` and
+`reanalyze` stamps a fresh version on the handle, and a solve carries the
+version it expects. If a solve reaches a handle whose version has already moved
+past the token, the factorization it named was replaced, so the native call
+reports a mismatch rather than solving the wrong matrix. This catches a token
+threaded into two separate writes, which `jit` cannot rule out on its own.
+`factor_and_solve_stateful` passes the version through unchanged, since it both
+writes and reads the factorization in one call, so the token stays valid for a
+later solve.
 
 ## Memory and the handle cache
 
