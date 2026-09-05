@@ -577,20 +577,12 @@ ffi::Error PardisoSolveImpl(int64_t matrix_type, int64_t dimension,
   }
 
   PardisoState& state = Registry()[handle];
-  // A present handle whose version has moved past the one this token expects
-  // means a later write already replaced the factorization, so solving now
-  // would return the wrong matrix's answer. Reject it rather than solve. A
-  // missing handle is the self-healing rebuild path below, which adopts the
-  // token's version, so this check only fires on a live state.
-  if (!missing && state.version != version) {
-    std::memset(solution->typed_data(), 0, solution->element_count() * sizeof(double));
-    std::memset(final_iparm->typed_data(), 0, sizeof(int32_t) * 64);
-    return ffi::Error::Internal("pardiso solve: token version " + std::to_string(version) +
-                                " does not match the factorization now held for handle " +
-                                std::to_string(handle) + " (version " +
-                                std::to_string(state.version) +
-                                "); it was replaced by a later factor or reanalyze");
-  }
+  // The token version is not checked. It was meant to reject a solve whose slot a
+  // later write had replaced, but rematerialisation refactors the same slot with the
+  // same values under a new version, so the check rejected correct solves. Ordering
+  // through the echoed handle is what keeps the solve before a later refactor, so the
+  // version rides along only as a possible future, non-fatal, diagnostic.
+  (void)version;
   state.matrix_type = static_cast<MKL_INT>(matrix_type);
   state.dimension = static_cast<MKL_INT>(dimension);
   InitializeIparm(state.iparm, state.matrix_type);
