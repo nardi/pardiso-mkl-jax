@@ -296,6 +296,8 @@ def _make_solve_stateful_core(
             (
                 jax.ShapeDtypeStruct(right_hand_side.shape, jnp.float64),
                 jax.ShapeDtypeStruct((64,), jnp.int32),
+                # The rebuild reason, a scalar RebuildReason code.
+                jax.ShapeDtypeStruct((), jnp.int32),
             ),
             has_side_effect=True,
         )(
@@ -334,16 +336,18 @@ def _make_solve_stateful_core(
             # so Pardiso solves all of them in one native call.
             original_shape = right_hand_side.shape
             fused = right_hand_side.reshape(-1, original_shape[-1])
-            solution, final_iparm = solve_stateful_core(
+            solution, final_iparm, rebuild_reason = solve_stateful_core(
                 token_id, indptr, indices, values, fused
             )
             solution = solution.reshape(original_shape)
-            return (solution, final_iparm), (True, False)
+            # final_iparm and rebuild_reason come from the one native call, so
+            # they are unbatched and broadcast across the batch dimension.
+            return (solution, final_iparm, rebuild_reason), (True, False, False)
 
         # Nothing batched. custom_vmap can still reach here if unrelated
         # arguments elsewhere in a larger vmapped computation were batched.
         result = solve_stateful_core(token_id, indptr, indices, values, right_hand_side)
-        return result, (False, False)
+        return result, (False, False, False)
 
     return solve_stateful_core
 
@@ -363,9 +367,13 @@ def solve_stateful(
 
     transpose solves A^T x = right_hand_side instead of A x = right_hand_side,
     reusing the same factorization. No call to factor() is needed to switch
-    between the two for a given token. Returns (solution, final_iparm), the
-    latter for decoding into a PardisoDiagnostics. To order a later release
-    after this solve, pass the solution to token.track (see release).
+    between the two for a given token. Returns
+    (solution, final_iparm, rebuild_reason): final_iparm for decoding into a
+    PardisoDiagnostics, and rebuild_reason a RebuildReason code saying whether
+    this solve reused the cached factorization or had to rebuild it (because
+    the slot was evicted/released, or held a different matrix than this call was
+    given). from_iparm takes both. To order a later release after this solve,
+    pass the solution to token.track (see release).
     """
     overlay_key = canonicalize_overlay(options)
     core = _make_solve_stateful_core(MatrixType(matrix_type), transpose, overlay_key)
@@ -392,6 +400,8 @@ def _make_factor_and_solve_stateful_core(
             (
                 jax.ShapeDtypeStruct(right_hand_side.shape, jnp.float64),
                 jax.ShapeDtypeStruct((64,), jnp.int32),
+                # The rebuild reason, a scalar RebuildReason code.
+                jax.ShapeDtypeStruct((), jnp.int32),
             ),
             has_side_effect=True,
         )(
@@ -424,11 +434,13 @@ def _make_factor_and_solve_stateful_core(
             # Phase 23 factors once and solves all RHS in one native call.
             original_shape = right_hand_side.shape
             fused = right_hand_side.reshape(-1, original_shape[-1])
-            solution, final_iparm = factor_and_solve_core(
+            solution, final_iparm, rebuild_reason = factor_and_solve_core(
                 token_id, indptr, indices, values, fused
             )
             solution = solution.reshape(original_shape)
-            return (solution, final_iparm), (True, False)
+            # final_iparm and rebuild_reason are from the one native call, so
+            # they are unbatched and broadcast across the batch dimension.
+            return (solution, final_iparm, rebuild_reason), (True, False, False)
 
         if values_batched:
             # Each batch element needs its own numeric factorization, but
@@ -436,17 +448,20 @@ def _make_factor_and_solve_stateful_core(
             # 23 per element, then stack.
             solutions = []
             iparms = []
+            rebuild_reasons = []
             for i in range(axis_size):
                 current_rhs = right_hand_side[i] if rhs_batched else right_hand_side
-                sol, iparm = factor_and_solve_core(
+                sol, iparm, rebuild_reason = factor_and_solve_core(
                     token_id, indptr, indices, values[i], current_rhs
                 )
                 solutions.append(sol)
                 iparms.append(iparm)
-            return (jnp.stack(solutions), jnp.stack(iparms)), (True, True)
+                rebuild_reasons.append(rebuild_reason)
+            stacked = (jnp.stack(solutions), jnp.stack(iparms), jnp.stack(rebuild_reasons))
+            return stacked, (True, True, True)
 
         result = factor_and_solve_core(token_id, indptr, indices, values, right_hand_side)
-        return result, (False, False)
+        return result, (False, False, False)
 
     return factor_and_solve_core
 
@@ -469,7 +484,11 @@ def factor_and_solve_stateful(
     factorization and the solve stay ordered under jit, unlike a factor()
     followed by a separate solve_stateful(). Those share no data dependency XLA
     must honor, so the solve could otherwise run before the factor. Returns
-    (solution, final_iparm), the latter for decoding into a PardisoDiagnostics.
+    (solution, final_iparm, rebuild_reason): final_iparm for decoding into a
+    PardisoDiagnostics, and rebuild_reason a RebuildReason code. Because phase
+    23 always refactors from the values it was given, its only possible rebuild
+    is a lost analysis (RebuildReason.EVICTED_OR_RELEASED), never a matrix
+    mismatch. from_iparm takes both.
     """
     overlay_key = canonicalize_overlay(options)
     core = _make_factor_and_solve_stateful_core(MatrixType(matrix_type), transpose, overlay_key)
@@ -647,7 +666,7 @@ def _make_solve_core(
                         if right_hand_side_batched
                         else right_hand_side[None, :]
                     )
-                    solution, final_iparm = solve_stateful(
+                    solution, final_iparm, _rebuild_reason = solve_stateful(
                         handle,
                         indptr,
                         indices,

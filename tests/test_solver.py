@@ -176,10 +176,10 @@ def test_whole_lifecycle_inside_jit_reuses_analysis(system):
 
     def run(values, other_values, right_hand_side):
         handle, _iparm = primitive.analyze(indptr, indices, values, matrix_type=matrix_type)
-        first, _iparm = primitive.factor_and_solve_stateful(
+        first, _iparm, _ = primitive.factor_and_solve_stateful(
             handle, indptr, indices, values, right_hand_side[None, :], matrix_type=matrix_type
         )
-        second, _iparm = primitive.factor_and_solve_stateful(
+        second, _iparm, _ = primitive.factor_and_solve_stateful(
             handle,
             indptr,
             indices,
@@ -214,7 +214,7 @@ def test_whole_lifecycle_inside_jit_does_not_leak_handles(system):
 
     def run(values, right_hand_side):
         handle, _iparm = primitive.analyze(indptr, indices, values, matrix_type=matrix_type)
-        solution, _iparm = primitive.factor_and_solve_stateful(
+        solution, _iparm, _ = primitive.factor_and_solve_stateful(
             handle, indptr, indices, values, right_hand_side[None, :], matrix_type=matrix_type
         )
         # Tracking the solution forces release() to run after the solve above,
@@ -346,7 +346,7 @@ def test_reanalyze_primitive_inside_and_outside_jit(system):
         handle, _iparm = primitive.factor(
             handle, indptr, indices, second_values, matrix_type=matrix_type
         )
-        solution, _iparm = primitive.solve_stateful(
+        solution, _iparm, _ = primitive.solve_stateful(
             handle,
             indptr,
             indices,
@@ -396,7 +396,7 @@ def test_reanalyze_rebuilds_an_evicted_handle(any_system):
 
     handle, _iparm = primitive.factor(handle, indptr, indices, values, matrix_type=matrix_type)
     stacked_rhs = jnp.asarray(right_hand_side)[None, :]
-    solution, _iparm = primitive.solve_stateful(
+    solution, _iparm, _ = primitive.solve_stateful(
         handle, indptr, indices, values, stacked_rhs, matrix_type=matrix_type
     )
     primitive.release(handle)
