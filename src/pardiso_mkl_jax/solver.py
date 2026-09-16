@@ -174,7 +174,7 @@ class PardisoSolver:
                     "applies to every call, or re-run analyze() with the new value."
                 )
 
-    def _record_diagnostics(self, final_iparm) -> PardisoDiagnostics:
+    def _record_diagnostics(self, final_iparm, rebuild_reason=None) -> PardisoDiagnostics:
         """Decode diagnostics, store them on the solver, and return them.
 
         Stores None instead when final_iparm is a tracer, which it is whenever
@@ -182,8 +182,13 @@ class PardisoSolver:
         it out of its trace, so reading last_diagnostics afterwards would
         raise rather than return anything useful. The returned value is the
         real one either way, so return_diagnostics still works under jit.
+
+        rebuild_reason is passed only by solve(), the one recorded call that can
+        rebuild a cached factorization; analyze and factorize factorize from the
+        values they were given, so they leave it None and it decodes to
+        RebuildReason.NONE.
         """
-        diagnostics = PardisoDiagnostics.from_iparm(final_iparm)
+        diagnostics = PardisoDiagnostics.from_iparm(final_iparm, rebuild_reason)
         self._last_diagnostics = None if isinstance(final_iparm, jax.core.Tracer) else diagnostics
         return diagnostics
 
@@ -375,7 +380,7 @@ class PardisoSolver:
         overlay = self._merge(options)
         self._check_pivot_settings(overlay, "solve()")
         stacked_right_hand_side = right_hand_side[None, :]
-        solution, final_iparm = primitive.solve_stateful(
+        solution, final_iparm, rebuild_reason = primitive.solve_stateful(
             self._handle,
             self._indptr,
             self._indices,
@@ -385,7 +390,7 @@ class PardisoSolver:
             transpose=transpose,
             options=overlay,
         )
-        diagnostics = self._record_diagnostics(final_iparm)
+        diagnostics = self._record_diagnostics(final_iparm, rebuild_reason)
         if return_diagnostics:
             return solution[0], diagnostics
         return solution[0]
@@ -422,7 +427,7 @@ class PardisoSolver:
         overlay = self._merge(options)
         self._check_pivot_settings(overlay, "refactor_and_solve()")
         stacked_right_hand_side = right_hand_side[None, :]
-        solution, final_iparm = primitive.factor_and_solve_stateful(
+        solution, final_iparm, rebuild_reason = primitive.factor_and_solve_stateful(
             self._handle,
             self._indptr,
             self._indices,
@@ -433,5 +438,5 @@ class PardisoSolver:
             options=overlay,
         )
         if return_diagnostics:
-            return solution[0], PardisoDiagnostics.from_iparm(final_iparm)
+            return solution[0], PardisoDiagnostics.from_iparm(final_iparm, rebuild_reason)
         return solution[0]

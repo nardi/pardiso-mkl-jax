@@ -127,6 +127,15 @@ MKL_INT* AsMklInt(const int32_t* data) {
 // distributes well and is cheap. Values are hashed by their exact bits, which
 // is what correctness needs: two matrices factor to the same thing exactly
 // when their values are bit-for-bit equal.
+// Why a stateful solve rebuilt its factorization, reported back to the caller
+// through a dedicated FFI output and decoded into PardisoDiagnostics. Kept in
+// sync with the RebuildReason enum in iparm.py.
+enum RebuildReason : int32_t {
+  kRebuildNone = 0,             // the cached factorization was reused as-is
+  kRebuildEvictedOrReleased = 1,  // the slot was empty (evicted or released)
+  kRebuildMatrixMismatch = 2,   // the slot held a different matrix (aliased/stale handle)
+};
+
 uint64_t MatrixFingerprint(MKL_INT matrix_type, MKL_INT dimension, const int32_t* indptr,
                            const int32_t* indices, const double* values) {
   uint64_t hash = 1469598103934665603ULL;  // FNV offset basis, a fixed nonzero seed
@@ -591,7 +600,8 @@ ffi::Error PardisoSolveImpl(int64_t matrix_type, int64_t dimension,
                              ffi::Buffer<ffi::S32> options_mask,
                              ffi::Buffer<ffi::S32> options_values,
                              ffi::ResultBuffer<ffi::F64> solution,
-                             ffi::ResultBuffer<ffi::S32> final_iparm) {
+                             ffi::ResultBuffer<ffi::S32> final_iparm,
+                             ffi::ResultBuffer<ffi::S32> rebuild_reason) {
   int64_t handle = handle_in.typed_data()[0];
 
   std::lock_guard<std::mutex> lock(RegistryMutex());
@@ -618,6 +628,13 @@ ffi::Error PardisoSolveImpl(int64_t matrix_type, int64_t dimension,
       !missing &&
       (!iterator->second.has_factorization || iterator->second.fingerprint != call_fingerprint);
   const bool needs_rebuild = missing || mismatch;
+
+  // Reported back to the caller so a rebuild is visible in diagnostics, not
+  // only through the process-wide rebuild counter. Filled on every return path
+  // below, including the error paths, so the output is never left uninitialized.
+  const int32_t reason_code =
+      missing ? kRebuildEvictedOrReleased : (mismatch ? kRebuildMatrixMismatch : kRebuildNone);
+  rebuild_reason->typed_data()[0] = reason_code;
 
   // Strict mode turns any rebuild into a loud error rather than quietly redoing
   // the work, naming which condition triggered it so a lost factorization
@@ -702,11 +719,17 @@ ffi::Error PardisoFactorSolveImpl(int64_t matrix_type, int64_t dimension,
                                    ffi::Buffer<ffi::S32> options_mask,
                                    ffi::Buffer<ffi::S32> options_values,
                                    ffi::ResultBuffer<ffi::F64> solution,
-                                   ffi::ResultBuffer<ffi::S32> final_iparm) {
+                                   ffi::ResultBuffer<ffi::S32> final_iparm,
+                                   ffi::ResultBuffer<ffi::S32> rebuild_reason) {
   int64_t handle = handle_in.typed_data()[0];
 
   std::lock_guard<std::mutex> lock(RegistryMutex());
   bool missing = Registry().find(handle) == Registry().end();
+  // Phase 23 always refactors from this call's values, so it never solves
+  // against a mismatched factorization; the only rebuild it can report is a
+  // lost analysis. Filled before any return so the output is never left
+  // uninitialized.
+  rebuild_reason->typed_data()[0] = missing ? kRebuildEvictedOrReleased : kRebuildNone;
   // A missing handle lost its analysis. Phase 23 refactors and solves but
   // still needs an analysis to reuse, so we rebuild that from this call's
   // matrix. Strict mode reports the miss instead.
@@ -914,6 +937,7 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(kPardisoSolveHandler, PardisoSolveImpl,
                                    .Arg<ffi::Buffer<ffi::S32>>()  // options_values
                                    .Ret<ffi::Buffer<ffi::F64>>()  // solution
                                    .Ret<ffi::Buffer<ffi::S32>>()  // final_iparm
+                                   .Ret<ffi::Buffer<ffi::S32>>()  // rebuild_reason
 );
 
 XLA_FFI_DEFINE_HANDLER_SYMBOL(kPardisoFactorSolveHandler, PardisoFactorSolveImpl,
@@ -931,6 +955,7 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(kPardisoFactorSolveHandler, PardisoFactorSolveImpl
                                    .Arg<ffi::Buffer<ffi::S32>>()  // options_values
                                    .Ret<ffi::Buffer<ffi::F64>>()  // solution
                                    .Ret<ffi::Buffer<ffi::S32>>()  // final_iparm
+                                   .Ret<ffi::Buffer<ffi::S32>>()  // rebuild_reason
 );
 
 XLA_FFI_DEFINE_HANDLER_SYMBOL(kPardisoReleaseHandler, PardisoReleaseImpl,

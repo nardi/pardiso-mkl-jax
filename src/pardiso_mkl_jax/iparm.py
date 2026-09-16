@@ -18,7 +18,38 @@ from collections.abc import Iterable, Mapping
 from typing import cast
 
 import jax
+import jax.numpy as jnp
 import numpy as np
+
+
+class RebuildReason(enum.IntEnum):
+    """Why a stateful solve had to rebuild its factorization, if it did.
+
+    A stateful solve reuses the factorization already sitting in its handle's
+    cache slot. It can only do that when the slot still holds the factors the
+    solve's own matrix would have produced; otherwise it rebuilds from the
+    matrix the call carries, so the answer is always for that matrix. This
+    records which of those happened, and is surfaced on
+    PardisoDiagnostics.rebuild_reason.
+
+    Values are stable integers, so a caller can compare
+    diagnostics.rebuild_reason against a member directly, including under jit
+    where the field is a traced scalar array.
+    """
+
+    NONE = 0
+    """The cached factorization was reused as-is; no rebuild happened."""
+
+    EVICTED_OR_RELEASED = 1
+    """The slot was empty (evicted from the bounded cache, or released), so the
+    factorization was rebuilt. A steady stream of these means the cache
+    (PARDISO_MKL_JAX_FACTOR_CACHE) is too small for the working set."""
+
+    MATRIX_MISMATCH = 2
+    """The slot held a factorization for a different matrix than the solve was
+    given, through an aliased handle or a stale token, so it was rebuilt rather
+    than used. A steady stream of these means a handle is being reused for a
+    matrix other than the one it was factored for."""
 
 
 class PardisoOption(enum.IntEnum):
@@ -364,12 +395,33 @@ class PardisoDiagnostics:
     min_out_of_core_memory_kb: jax.Array
     """Minimum memory required for out-of-core factorization, in KB (iparm[62])."""
 
+    rebuild_reason: jax.Array
+    """Whether this call had to rebuild its factorization, as a RebuildReason code.
+
+    A scalar int matching a RebuildReason member: NONE when the cached
+    factorization was reused, EVICTED_OR_RELEASED or MATRIX_MISMATCH when it was
+    rebuilt (see RebuildReason). Only ever nonzero for a stateful solve
+    (PardisoSolver.solve or refactor_and_solve, and the primitive.solve_stateful
+    / factor_and_solve_stateful they build on), the only calls that reuse a
+    cached factorization. Every other call, including the functional solve,
+    factorizes from the values it was given and so always reports NONE."""
+
     raw: jax.Array
     """All 64 iparm entries, for anything not decoded into a named field above."""
 
     @staticmethod
-    def from_iparm(iparm: jax.Array) -> PardisoDiagnostics:
-        """Decode a final iparm array (shape (..., 64)) into a PardisoDiagnostics."""
+    def from_iparm(iparm: jax.Array, rebuild_reason: jax.Array | None = None) -> PardisoDiagnostics:
+        """Decode a final iparm array (shape (..., 64)) into a PardisoDiagnostics.
+
+        rebuild_reason is the RebuildReason code for a stateful solve that may
+        have rebuilt its factorization; the calls that can never rebuild leave
+        it None, which decodes to RebuildReason.NONE broadcast to iparm's batch
+        shape. Passing it stays trace-safe: it is a scalar array threaded
+        straight through, and the None default builds a zero with the same
+        static shape, so this works whether iparm is concrete or traced.
+        """
+        if rebuild_reason is None:
+            rebuild_reason = jnp.zeros(iparm.shape[:-1], dtype=jnp.int32)
         return PardisoDiagnostics(
             refinement_steps_performed=iparm[..., 6],
             perturbed_pivot_count=iparm[..., 13],
@@ -383,5 +435,6 @@ class PardisoDiagnostics:
             negative_eigenvalues=iparm[..., 22],
             zero_or_negative_pivot_position=iparm[..., 29],
             min_out_of_core_memory_kb=iparm[..., 62],
+            rebuild_reason=rebuild_reason,
             raw=iparm,
         )

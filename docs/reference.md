@@ -20,6 +20,10 @@
 
 ::: pardiso_mkl_jax.PardisoDiagnostics
 
+## `RebuildReason`
+
+::: pardiso_mkl_jax.RebuildReason
+
 ## `rebuild_count`
 
 ::: pardiso_mkl_jax.rebuild_count
