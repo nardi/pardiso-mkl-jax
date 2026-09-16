@@ -57,6 +57,16 @@ struct PardisoState {
   MKL_INT matrix_type = 0;
   MKL_INT dimension = 0;
   long analysis_count = 0;
+  // Fingerprint of the matrix the current numeric factorization represents,
+  // set whenever a factorization is produced (phase 22 or 23) and cleared
+  // whenever it is discarded (a re-analysis). A solve consults it to tell
+  // whether the factors in this slot are the ones its own matrix would have
+  // produced, and rebuilds rather than solving against the wrong ones if not.
+  // See MatrixFingerprint and PardisoSolveImpl. has_factorization is false
+  // until the first factorization, so a solve that reaches an analyzed but
+  // not-yet-factored slot rebuilds instead of solving against absent factors.
+  uint64_t fingerprint = 0;
+  bool has_factorization = false;
 };
 
 // Forces the LP64 interface layer, matching the int32 CSR indices this
@@ -95,6 +105,52 @@ std::atomic<int64_t>& HandleCounter() {
 // 32-bit int here, the same width and representation as int32_t.
 MKL_INT* AsMklInt(const int32_t* data) {
   return const_cast<MKL_INT*>(reinterpret_cast<const MKL_INT*>(data));
+}
+
+// A 64-bit fingerprint of the matrix a factorization stands for: its type,
+// dimension, sparsity pattern, and values. Two calls presenting the same
+// matrix produce the same fingerprint; any difference (different values, a
+// different pattern, a different type or size) produces a different one with
+// overwhelming probability. It exists so a stateful solve can tell, cheaply,
+// whether the factorization sitting in its cache slot is the one its own
+// matrix would have produced, or whether the slot was refactored out from
+// under it (an aliased handle, a stale token) and must be rebuilt.
+//
+// This is a hash, not a comparison against a stored copy of the matrix:
+// keeping a copy would defeat the zero-copy interface and the bounded-memory
+// guarantee the cache exists for. A 64-bit collision (two different matrices
+// hashing equal, so a stale factorization is used as if it matched) has
+// probability about 2^-64 per compared pair, far below the rate of unrelated
+// hardware error, so it does not weaken the guarantee in practice.
+//
+// The mixing step is the standard boost hash_combine over 64-bit words, which
+// distributes well and is cheap. Values are hashed by their exact bits, which
+// is what correctness needs: two matrices factor to the same thing exactly
+// when their values are bit-for-bit equal.
+uint64_t MatrixFingerprint(MKL_INT matrix_type, MKL_INT dimension, const int32_t* indptr,
+                           const int32_t* indices, const double* values) {
+  uint64_t hash = 1469598103934665603ULL;  // FNV offset basis, a fixed nonzero seed
+  auto combine = [&hash](uint64_t word) {
+    hash ^= word + 0x9e3779b97f4a7c15ULL + (hash << 6) + (hash >> 2);
+  };
+  combine(static_cast<uint64_t>(matrix_type));
+  combine(static_cast<uint64_t>(dimension));
+  // Zero-based indexing (iparm[34] = 1) means indptr[0] is 0 and indptr[n] is
+  // the number of stored entries, so this covers the whole of indices/values.
+  const int64_t entry_count = dimension >= 0 ? static_cast<int64_t>(indptr[dimension]) : 0;
+  combine(static_cast<uint64_t>(entry_count));
+  for (int64_t i = 0; i <= dimension; ++i) {
+    combine(static_cast<uint64_t>(static_cast<uint32_t>(indptr[i])));
+  }
+  for (int64_t i = 0; i < entry_count; ++i) {
+    combine(static_cast<uint64_t>(static_cast<uint32_t>(indices[i])));
+  }
+  for (int64_t i = 0; i < entry_count; ++i) {
+    uint64_t bits;
+    std::memcpy(&bits, &values[i], sizeof(bits));
+    combine(bits);
+  }
+  return hash;
 }
 
 // Fills iparm with this package's defaults. iparm[0] is set to 1, meaning
@@ -431,6 +487,11 @@ ffi::Error PardisoReanalyzeImpl(int64_t matrix_type, int64_t dimension,
           state.iparm, &message_level, /*b=*/nullptr, /*x=*/nullptr, &error);
 
   state.analysis_count += 1;
+  // The re-analysis discarded any numeric factorization, so the slot no longer
+  // stands for any matrix. Clearing this makes a solve before the next factor
+  // rebuild rather than solve against factors that are gone.
+  state.has_factorization = false;
+  state.fingerprint = 0;
   TouchLru(handle);
   EvictIfNeeded();
   handle_out->typed_data()[0] = handle;
@@ -504,6 +565,14 @@ ffi::Error PardisoFactorImpl(int64_t matrix_type, int64_t dimension,
   if (error != 0) {
     return ffi::Error::Internal(PardisoErrorMessage("factor", error));
   }
+  // Record which matrix this factorization now represents, so a later solve
+  // can detect an aliased or stale handle and rebuild rather than solve
+  // against the wrong factors. Set only on success: a failed factorization
+  // leaves no usable factors, and the slot rebuilds on next use anyway.
+  state.fingerprint =
+      MatrixFingerprint(state.matrix_type, state.dimension, indptr.typed_data(),
+                        indices.typed_data(), values.typed_data());
+  state.has_factorization = true;
   return ffi::Error::Success();
 }
 
@@ -526,15 +595,43 @@ ffi::Error PardisoSolveImpl(int64_t matrix_type, int64_t dimension,
   int64_t handle = handle_in.typed_data()[0];
 
   std::lock_guard<std::mutex> lock(RegistryMutex());
-  bool missing = Registry().find(handle) == Registry().end();
-  // A missing handle lost both its analysis and its factorization. A solve
-  // needs both, so we rebuild them from this call's matrix before solving.
-  // Strict mode reports the miss instead of quietly redoing the work.
-  if (missing && StrictCache()) {
+  auto iterator = Registry().find(handle);
+  bool missing = iterator == Registry().end();
+
+  // A solve reuses the factorization sitting in this handle's slot, but it may
+  // reuse it only if the slot still holds the factors this call's own matrix
+  // would have produced. Two things can make that false. The slot may be
+  // missing: evicted from the bounded cache, or explicitly released, losing
+  // both analysis and factorization. Or the slot may hold a factorization for
+  // a *different* matrix: another factor() on the same handle, through an
+  // aliased handle or a stale token, replaced the factors in place, and
+  // nothing about the id reflects that. Solving against those factors would
+  // silently return an answer for the wrong matrix. Both are handled the same
+  // way, by rebuilding from the matrix this call carries, so the answer is
+  // always for the matrix the caller actually passed. A content mismatch is
+  // detected by comparing a fingerprint of this call's matrix against the one
+  // recorded when the slot was last factored.
+  const uint64_t call_fingerprint =
+      MatrixFingerprint(static_cast<MKL_INT>(matrix_type), static_cast<MKL_INT>(dimension),
+                        indptr.typed_data(), indices.typed_data(), values.typed_data());
+  const bool mismatch =
+      !missing &&
+      (!iterator->second.has_factorization || iterator->second.fingerprint != call_fingerprint);
+  const bool needs_rebuild = missing || mismatch;
+
+  // Strict mode turns any rebuild into a loud error rather than quietly redoing
+  // the work, naming which condition triggered it so a lost factorization
+  // (a cache too small) and an aliased or stale handle (a correctness bug in
+  // the caller) can be told apart while debugging.
+  if (needs_rebuild && StrictCache()) {
     std::memset(solution->typed_data(), 0, solution->element_count() * sizeof(double));
     std::memset(final_iparm->typed_data(), 0, sizeof(int32_t) * 64);
-    return ffi::Error::Internal("pardiso solve: handle " + std::to_string(handle) +
-                                " was evicted or freed and strict cache mode is on");
+    const char* reason =
+        missing ? " was evicted or freed"
+                : " holds a factorization for a different matrix than the solve was given"
+                  " (an aliased handle or a stale token)";
+    return ffi::Error::Internal("pardiso solve: handle " + std::to_string(handle) + reason +
+                                " and strict cache mode is on");
   }
 
   PardisoState& state = Registry()[handle];
@@ -547,10 +644,12 @@ ffi::Error PardisoSolveImpl(int64_t matrix_type, int64_t dimension,
   // earlier call. Applied after ApplyOverlay: canonicalize_overlay in
   // iparm.py guarantees a caller-supplied overlay never touches index 11
   // (transpose_mode is the sole owner of it), so there is no real conflict
-  // to resolve here.
+  // to resolve here. The transpose mode is not part of the fingerprint:
+  // it does not change the matrix, only which triangular solves run, so
+  // alternating transpose on one handle reuses the same factorization.
   state.iparm[11] = static_cast<MKL_INT>(transpose_mode);
 
-  if (missing) {
+  if (needs_rebuild) {
     RebuildCounter().fetch_add(1);
     MKL_INT rebuild_error =
         RunAnalysis(state, indptr.typed_data(), indices.typed_data(), values.typed_data());
@@ -562,6 +661,10 @@ ffi::Error PardisoSolveImpl(int64_t matrix_type, int64_t dimension,
       std::memcpy(final_iparm->typed_data(), state.iparm, sizeof(MKL_INT) * 64);
       return ffi::Error::Internal(PardisoErrorMessage("solve rebuild", rebuild_error));
     }
+    // The slot now holds this call's matrix; record it so a later solve on the
+    // same handle for the same matrix reuses these factors instead of rebuilding.
+    state.fingerprint = call_fingerprint;
+    state.has_factorization = true;
   }
 
   MKL_INT maxfct = 1;
@@ -653,6 +756,13 @@ ffi::Error PardisoFactorSolveImpl(int64_t matrix_type, int64_t dimension,
   if (error != 0) {
     return ffi::Error::Internal(PardisoErrorMessage("factor_and_solve", error));
   }
+  // Phase 23 always factored from this call's values, so the slot now
+  // represents this matrix. Record it so a later plain solve on the same
+  // handle can tell whether it still holds these factors.
+  state.fingerprint =
+      MatrixFingerprint(state.matrix_type, state.dimension, indptr.typed_data(),
+                        indices.typed_data(), values.typed_data());
+  state.has_factorization = true;
   return ffi::Error::Success();
 }
 

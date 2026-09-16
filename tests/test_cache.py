@@ -20,6 +20,24 @@ from pardiso_mkl_jax import primitive
 MATRIX_TYPE = pmj.MatrixType.REAL_NONSYMMETRIC
 
 
+def _dense_from_csr(indptr, indices, values):
+    """Build a dense matrix from zero-based CSR arrays, for a reference solve.
+
+    The fixtures hand back a dense reference for their own values; a test that
+    solves with different values on the same pattern needs the dense form of
+    those values, which this reconstructs.
+    """
+    indptr = np.asarray(indptr)
+    indices = np.asarray(indices)
+    values = np.asarray(values)
+    dimension = indptr.shape[0] - 1
+    dense = np.zeros((dimension, dimension), dtype=np.float64)
+    for row in range(dimension):
+        for entry in range(indptr[row], indptr[row + 1]):
+            dense[row, indices[entry]] = values[entry]
+    return dense
+
+
 def _analyze_factor(indptr, indices, values):
     """Analyze then factor a system, returning a ready-to-solve token."""
     token, _ = primitive.analyze(indptr, indices, values, matrix_type=MATRIX_TYPE)
@@ -58,6 +76,133 @@ def test_forgotten_handles_are_bounded_and_rebuild(any_system, monkeypatch):
     assert primitive.rebuild_count() >= 1
     expected = np.linalg.solve(dense, right_hand_side)
     np.testing.assert_allclose(np.asarray(solution[0]), expected, rtol=1e-8, atol=1e-10)
+
+
+def test_solve_with_different_values_rebuilds_rather_than_using_stale_factors(
+    any_system, monkeypatch
+):
+    """A solve whose values differ from the stored factorization rebuilds.
+
+    The handle names a cache slot, not the matrix in it, and the slot's numeric
+    factors are what a solve reuses. If a solve is handed values for a different
+    matrix on the same pattern than the one factored into the slot, solving
+    against the stored factors would silently answer for the wrong matrix. The
+    solve fingerprints its matrix and, on a mismatch, rebuilds from the values
+    it was given, so the answer is always for that matrix. This pins that: it
+    factors one matrix, then solves the same handle with a second matrix's
+    values and checks the answer matches the second matrix and a rebuild ran.
+    """
+    indptr, indices, values, _dense, right_hand_side = any_system
+    indptr, indices = jnp.asarray(indptr), jnp.asarray(indices)
+    values = jnp.asarray(values)
+    other_values = values * 2.0 + 1.0
+    other_dense = _dense_from_csr(indptr, indices, other_values)
+
+    handle = _analyze_factor(indptr, indices, values)
+
+    primitive.reset_rebuild_count()
+    solution, _ = primitive.solve_stateful(
+        handle,
+        indptr,
+        indices,
+        other_values,
+        jnp.asarray(right_hand_side)[None, :],
+        matrix_type=MATRIX_TYPE,
+    )
+    assert primitive.rebuild_count() >= 1
+    expected = np.linalg.solve(other_dense, right_hand_side)
+    np.testing.assert_allclose(np.asarray(solution[0]), expected, rtol=1e-8, atol=1e-10)
+
+
+def test_aliased_refactor_does_not_corrupt_a_solve_on_the_original_matrix(any_system):
+    """Refactoring a handle for a new matrix cannot silently change another solve.
+
+    This is the aliasing hazard directly: one factorization, then a second
+    factor() on the same handle for a different matrix (as an aliased or stale
+    token would do), replacing the factors in place. A later solve that still
+    means the original matrix passes the original values, so its fingerprint no
+    longer matches the slot, and it rebuilds rather than solving against the
+    matrix that overwrote it. Checks the original solve still gets the original
+    answer.
+    """
+    indptr, indices, values, dense, right_hand_side = any_system
+    indptr, indices = jnp.asarray(indptr), jnp.asarray(indices)
+    values = jnp.asarray(values)
+    other_values = values * 3.0 - 0.5
+
+    handle = _analyze_factor(indptr, indices, values)
+    # Second factorization on the same handle, for a different matrix. This is
+    # what an aliased handle or stale token does: the slot now holds these
+    # factors, not the original ones.
+    handle, _ = primitive.factor(handle, indptr, indices, other_values, matrix_type=MATRIX_TYPE)
+
+    solution, _ = primitive.solve_stateful(
+        handle,
+        indptr,
+        indices,
+        values,  # still the original matrix
+        jnp.asarray(right_hand_side)[None, :],
+        matrix_type=MATRIX_TYPE,
+    )
+    expected = np.linalg.solve(dense, right_hand_side)
+    np.testing.assert_allclose(np.asarray(solution[0]), expected, rtol=1e-8, atol=1e-10)
+
+
+def test_strict_mode_errors_when_the_slot_holds_a_different_matrix(any_system, monkeypatch):
+    """Strict mode raises on a content mismatch, not only on an evicted handle.
+
+    A mismatch is a caller bug (an aliased handle or a stale token), distinct
+    from an eviction, so strict mode surfaces it loudly rather than rebuilding.
+    This factors one matrix, then solves the same handle with a second matrix's
+    values under strict mode and checks it raises and says the slot holds a
+    different matrix.
+    """
+    indptr, indices, values, _dense, right_hand_side = any_system
+    indptr, indices = jnp.asarray(indptr), jnp.asarray(indices)
+    values = jnp.asarray(values)
+
+    handle = _analyze_factor(indptr, indices, values)
+    monkeypatch.setenv("PARDISO_MKL_JAX_STRICT_CACHE", "1")
+
+    with pytest.raises(Exception, match="different matrix"):
+        primitive.solve_stateful(
+            handle,
+            indptr,
+            indices,
+            values * 2.0,
+            jnp.asarray(right_hand_side)[None, :],
+            matrix_type=MATRIX_TYPE,
+        )
+
+
+def test_transpose_alternation_reuses_the_factorization_without_rebuilding(any_system):
+    """Alternating transpose on one handle reuses the factors, no rebuild.
+
+    The transpose mode is not part of the matrix fingerprint, so switching it
+    between solves on the same handle must not be mistaken for a different
+    matrix. This solves once each way and checks neither caused a rebuild.
+    """
+    indptr, indices, values, dense, right_hand_side = any_system
+    indptr, indices = jnp.asarray(indptr), jnp.asarray(indices)
+    values = jnp.asarray(values)
+    stacked = jnp.asarray(right_hand_side)[None, :]
+
+    handle = _analyze_factor(indptr, indices, values)
+
+    primitive.reset_rebuild_count()
+    forward, _ = primitive.solve_stateful(
+        handle, indptr, indices, values, stacked, matrix_type=MATRIX_TYPE
+    )
+    transposed, _ = primitive.solve_stateful(
+        handle, indptr, indices, values, stacked, matrix_type=MATRIX_TYPE, transpose=True
+    )
+    assert primitive.rebuild_count() == 0
+    np.testing.assert_allclose(
+        np.asarray(forward[0]), np.linalg.solve(dense, right_hand_side), rtol=1e-8, atol=1e-10
+    )
+    np.testing.assert_allclose(
+        np.asarray(transposed[0]), np.linalg.solve(dense.T, right_hand_side), rtol=1e-8, atol=1e-10
+    )
 
 
 def test_strict_mode_turns_a_rebuild_into_an_error(any_system, monkeypatch):

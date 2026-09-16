@@ -79,11 +79,17 @@ def default_iparm(matrix_type: MatrixType) -> np.ndarray:
 def rebuild_count() -> int:
     """Number of factorization rebuilds since load or the last reset.
 
-    A factorization is rebuilt whenever a call reaches a handle that was
-    evicted from the bounded cache or released, using the matrix the call
-    already carries. Rebuilds keep results correct but cost the redone work, so
-    a steadily rising count means the cache (PARDISO_MKL_JAX_FACTOR_CACHE) is
-    too small for how many factorizations are kept live at once.
+    A factorization is rebuilt whenever a call reaches a handle whose slot does
+    not hold the factors that call needs, using the matrix the call already
+    carries. That happens two ways: the handle was evicted from the bounded
+    cache or released (the slot is empty), or the slot was refactored for a
+    different matrix through an aliased handle or a stale token (the factors are
+    the wrong ones), which a solve detects by fingerprint and rebuilds rather
+    than answering for the wrong matrix. Rebuilds keep results correct but cost
+    the redone work. A count that climbs from eviction means the cache
+    (PARDISO_MKL_JAX_FACTOR_CACHE) is too small for how many factorizations are
+    kept live at once; a count that climbs from mismatch means a handle is being
+    reused for a matrix other than the one it was factored for.
     """
     return int(_ffi.rebuild_count())
 

@@ -216,19 +216,31 @@ factorizations, and this is what makes the token API memory-safe:
   the matrix it needs, so a call that lands on a token no longer in the cache
   rebuilds its factorization on the spot and continues. The answer is the same,
   it just costs the rebuild.
+- **A solve never uses the wrong factorization.** A token's cache id names a
+  slot, not the matrix in it, and the slot's numeric factors can be replaced in
+  place by a later `factorize` or `refactor_and_solve` on the same id, whether
+  through a deliberately shared token or an accidentally aliased or stale one.
+  A `solve` guards against that: it fingerprints the matrix it was given and, if
+  the slot holds a factorization for a different matrix, rebuilds from the
+  values passed to the solve rather than answering for the matrix that
+  overwrote it. So the worst an aliased or stale token can cost is a rebuild,
+  never a silently wrong answer. (`refactor_and_solve` is unaffected either way:
+  it always factorizes from its own values before solving.)
 
 Rebuilds are correct but not free, so a program that keeps more factorizations
-live than the cache holds pays to rebuild them over and over. Two tools help
-find that:
+live than the cache holds, or that reuses one token for several different
+matrices, pays to rebuild them over and over. Two tools help find that:
 
 - [`pardiso_mkl_jax.rebuild_count`][pardiso_mkl_jax.rebuild_count] returns how
   many rebuilds have happened. A count that climbs during steady-state solving
   means the cache is too small for the working set. Reset it with
   `reset_rebuild_count`.
 - Setting `PARDISO_MKL_JAX_STRICT_CACHE` turns any rebuild into an error that
-  names the token, so a lost factorization fails loudly instead of quietly
-  slowing things down. Leave it off in production and switch it on while
-  debugging performance.
+  names the token and says whether its slot was lost (evicted or freed) or holds
+  a different matrix (an aliased or stale token), so both a lost factorization
+  and a misused token fail loudly instead of quietly slowing things down or
+  rebuilding. Leave it off in production and switch it on while debugging
+  performance or a suspected aliasing bug.
 
 ### When is it safe to release explicitly?
 
