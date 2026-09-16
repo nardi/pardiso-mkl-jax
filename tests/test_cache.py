@@ -65,7 +65,7 @@ def test_forgotten_handles_are_bounded_and_rebuild(any_system, monkeypatch):
         _analyze_factor(indptr, indices, values)
 
     primitive.reset_rebuild_count()
-    solution, _ = primitive.solve_stateful(
+    solution, _, _ = primitive.solve_stateful(
         first_handle,
         indptr,
         indices,
@@ -101,7 +101,7 @@ def test_solve_with_different_values_rebuilds_rather_than_using_stale_factors(
     handle = _analyze_factor(indptr, indices, values)
 
     primitive.reset_rebuild_count()
-    solution, _ = primitive.solve_stateful(
+    solution, _, _ = primitive.solve_stateful(
         handle,
         indptr,
         indices,
@@ -136,7 +136,7 @@ def test_aliased_refactor_does_not_corrupt_a_solve_on_the_original_matrix(any_sy
     # factors, not the original ones.
     handle, _ = primitive.factor(handle, indptr, indices, other_values, matrix_type=MATRIX_TYPE)
 
-    solution, _ = primitive.solve_stateful(
+    solution, _, _ = primitive.solve_stateful(
         handle,
         indptr,
         indices,
@@ -175,6 +175,99 @@ def test_strict_mode_errors_when_the_slot_holds_a_different_matrix(any_system, m
         )
 
 
+def test_rebuild_reason_reports_none_on_a_plain_reuse(any_system):
+    """A solve that reuses the cached factorization reports RebuildReason.NONE.
+
+    This is the common path: analyze, factor, then solve the same matrix. The
+    reason surfaces both as the primitive's third return and, decoded, on
+    PardisoDiagnostics.rebuild_reason.
+    """
+    indptr, indices, values, _dense, right_hand_side = any_system
+    indptr, indices = jnp.asarray(indptr), jnp.asarray(indices)
+    values = jnp.asarray(values)
+
+    handle = _analyze_factor(indptr, indices, values)
+    _solution, final_iparm, reason = primitive.solve_stateful(
+        handle,
+        indptr,
+        indices,
+        values,
+        jnp.asarray(right_hand_side)[None, :],
+        matrix_type=MATRIX_TYPE,
+    )
+    assert int(reason) == pmj.RebuildReason.NONE
+    diagnostics = pmj.PardisoDiagnostics.from_iparm(final_iparm, reason)
+    assert int(diagnostics.rebuild_reason) == pmj.RebuildReason.NONE
+
+
+def test_rebuild_reason_reports_matrix_mismatch(any_system):
+    """A solve handed a different matrix reports RebuildReason.MATRIX_MISMATCH."""
+    indptr, indices, values, _dense, right_hand_side = any_system
+    indptr, indices = jnp.asarray(indptr), jnp.asarray(indices)
+    values = jnp.asarray(values)
+
+    handle = _analyze_factor(indptr, indices, values)
+    _solution, _final_iparm, reason = primitive.solve_stateful(
+        handle,
+        indptr,
+        indices,
+        values * 2.0,
+        jnp.asarray(right_hand_side)[None, :],
+        matrix_type=MATRIX_TYPE,
+    )
+    assert int(reason) == pmj.RebuildReason.MATRIX_MISMATCH
+
+
+def test_rebuild_reason_reports_eviction(any_system, monkeypatch):
+    """A solve through an evicted handle reports RebuildReason.EVICTED_OR_RELEASED."""
+    indptr, indices, values, _dense, right_hand_side = any_system
+    indptr, indices = jnp.asarray(indptr), jnp.asarray(indices)
+    values = jnp.asarray(values)
+
+    monkeypatch.setenv("PARDISO_MKL_JAX_FACTOR_CACHE", "1")
+    handle = _analyze_factor(indptr, indices, values)
+    _analyze_factor(indptr, indices, values)  # evicts handle (capacity 1)
+
+    _solution, _final_iparm, reason = primitive.solve_stateful(
+        handle,
+        indptr,
+        indices,
+        values,
+        jnp.asarray(right_hand_side)[None, :],
+        matrix_type=MATRIX_TYPE,
+    )
+    assert int(reason) == pmj.RebuildReason.EVICTED_OR_RELEASED
+
+
+def test_pardiso_solver_reports_rebuild_reason_through_diagnostics(any_system, monkeypatch):
+    """PardisoSolver.solve surfaces the rebuild reason on its diagnostics.
+
+    A plain reuse reports NONE. After the factorization is evicted, the next
+    solve rebuilds and reports EVICTED_OR_RELEASED. PardisoSolver always solves
+    with the values it factored, so a matrix mismatch cannot arise here. That
+    case is covered at the primitive level above.
+    """
+    indptr, indices, values, _dense, right_hand_side = any_system
+    indptr, indices = jnp.asarray(indptr), jnp.asarray(indices)
+    values = jnp.asarray(values)
+    right_hand_side = jnp.asarray(right_hand_side)
+
+    monkeypatch.setenv("PARDISO_MKL_JAX_FACTOR_CACHE", "1")
+    solver = pmj.PardisoSolver(indptr, indices, matrix_type=MATRIX_TYPE)
+    solver.analyze(values)
+    solver.factorize(values)
+
+    _first, diagnostics = solver.solve(right_hand_side, return_diagnostics=True)
+    assert int(diagnostics.rebuild_reason) == pmj.RebuildReason.NONE
+
+    # Evict this solver's factorization by overrunning the single cache slot.
+    other = _analyze_factor(indptr, indices, values)
+    del other
+
+    _second, diagnostics = solver.solve(right_hand_side, return_diagnostics=True)
+    assert int(diagnostics.rebuild_reason) == pmj.RebuildReason.EVICTED_OR_RELEASED
+
+
 def test_transpose_alternation_reuses_the_factorization_without_rebuilding(any_system):
     """Alternating transpose on one handle reuses the factors, no rebuild.
 
@@ -190,10 +283,10 @@ def test_transpose_alternation_reuses_the_factorization_without_rebuilding(any_s
     handle = _analyze_factor(indptr, indices, values)
 
     primitive.reset_rebuild_count()
-    forward, _ = primitive.solve_stateful(
+    forward, _, _ = primitive.solve_stateful(
         handle, indptr, indices, values, stacked, matrix_type=MATRIX_TYPE
     )
-    transposed, _ = primitive.solve_stateful(
+    transposed, _, _ = primitive.solve_stateful(
         handle, indptr, indices, values, stacked, matrix_type=MATRIX_TYPE, transpose=True
     )
     assert primitive.rebuild_count() == 0
@@ -247,7 +340,7 @@ def test_released_handle_rebuilds_on_next_solve(any_system):
     primitive.release(handle)
 
     primitive.reset_rebuild_count()
-    solution, _ = primitive.solve_stateful(
+    solution, _, _ = primitive.solve_stateful(
         handle,
         indptr,
         indices,
@@ -276,7 +369,7 @@ def test_full_lifecycle_inside_jit(any_system):
     def run(rhs):
         handle, _ = primitive.analyze(indptr, indices, values, matrix_type=MATRIX_TYPE)
         handle, _ = primitive.factor(handle, indptr, indices, values, matrix_type=MATRIX_TYPE)
-        solution, _ = primitive.solve_stateful(
+        solution, _, _ = primitive.solve_stateful(
             handle, indptr, indices, values, rhs[None, :], matrix_type=MATRIX_TYPE
         )
         primitive.release(handle)
@@ -305,7 +398,7 @@ def test_eager_analyze_then_jitted_solve_self_heals(any_system, monkeypatch):
 
     @jax.jit
     def solve(rhs):
-        solution, _ = primitive.solve_stateful(
+        solution, _, _ = primitive.solve_stateful(
             handle, indptr, indices, values, rhs[None, :], matrix_type=MATRIX_TYPE
         )
         return solution[0]
@@ -333,7 +426,7 @@ def test_track_orders_a_release_after_the_solve(any_system):
 
     @jax.jit
     def solve_and_release(token, rhs):
-        solution, _ = primitive.solve_stateful(
+        solution, _, _ = primitive.solve_stateful(
             token, indptr, indices, values, rhs[None, :], matrix_type=MATRIX_TYPE
         )
         primitive.release(token.track(solution))
@@ -360,7 +453,7 @@ def test_release_dependency_orders_after_the_solve(any_system):
 
     @jax.jit
     def solve_and_release(token, rhs):
-        solution, _ = primitive.solve_stateful(
+        solution, _, _ = primitive.solve_stateful(
             token, indptr, indices, values, rhs[None, :], matrix_type=MATRIX_TYPE
         )
         primitive.release(token, dependency=solution)
@@ -422,7 +515,7 @@ def test_many_solves_in_a_scan_then_release(any_system):
     @jax.jit
     def run(token, rhs_sequence):
         def step(token, rhs):
-            solution, _ = primitive.solve_stateful(
+            solution, _, _ = primitive.solve_stateful(
                 token, indptr, indices, values, rhs[None, :], matrix_type=MATRIX_TYPE
             )
             return token.track(solution[0]), solution[0]
@@ -456,7 +549,7 @@ def test_many_solves_batched_then_release(any_system):
 
     @jax.jit
     def solve_and_release(token, right_hand_sides):
-        solutions, _ = primitive.solve_stateful(
+        solutions, _, _ = primitive.solve_stateful(
             token, indptr, indices, values, right_hand_sides, matrix_type=MATRIX_TYPE
         )
         primitive.release(token.track(solutions))
