@@ -208,7 +208,11 @@ def test_rebuild_reason_reports_matrix_mismatch(any_system):
 
     handle = _analyze_factor(indptr, indices, values)
     _solution, _final_iparm, reason = primitive.solve_stateful(
-        handle, indptr, indices, values * 2.0, jnp.asarray(right_hand_side)[None, :],
+        handle,
+        indptr,
+        indices,
+        values * 2.0,
+        jnp.asarray(right_hand_side)[None, :],
         matrix_type=MATRIX_TYPE,
     )
     assert int(reason) == pmj.RebuildReason.MATRIX_MISMATCH
