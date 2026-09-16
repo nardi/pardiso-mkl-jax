@@ -184,7 +184,7 @@ right_hand_side = jnp.array([1.0, 2.0, 3.0], dtype=jnp.float64)
 matrix_type = pmj.MatrixType.REAL_NONSYMMETRIC
 
 token, _final_iparm = primitive.analyze(indptr, indices, values, matrix_type=matrix_type)
-solution, final_iparm = primitive.factor_and_solve_stateful(
+solution, final_iparm, _rebuild_reason = primitive.factor_and_solve_stateful(
     token, indptr, indices, values, right_hand_side[None, :], matrix_type=matrix_type
 )
 primitive.release(token)
@@ -216,19 +216,31 @@ factorizations, and this is what makes the token API memory-safe:
   the matrix it needs, so a call that lands on a token no longer in the cache
   rebuilds its factorization on the spot and continues. The answer is the same,
   it just costs the rebuild.
+- **A solve never uses the wrong factorization.** A token's cache id names a
+  slot, not the matrix in it, and the slot's numeric factors can be replaced in
+  place by a later `factorize` or `refactor_and_solve` on the same id, whether
+  through a deliberately shared token or an accidentally aliased or stale one.
+  A `solve` guards against that: it fingerprints the matrix it was given and, if
+  the slot holds a factorization for a different matrix, rebuilds from the
+  values passed to the solve rather than answering for the matrix that
+  overwrote it. So the worst an aliased or stale token can cost is a rebuild,
+  never a silently wrong answer. (`refactor_and_solve` is unaffected either way:
+  it always factorizes from its own values before solving.)
 
 Rebuilds are correct but not free, so a program that keeps more factorizations
-live than the cache holds pays to rebuild them over and over. Two tools help
-find that:
+live than the cache holds, or that reuses one token for several different
+matrices, pays to rebuild them over and over. Two tools help find that:
 
 - [`pardiso_mkl_jax.rebuild_count`][pardiso_mkl_jax.rebuild_count] returns how
   many rebuilds have happened. A count that climbs during steady-state solving
   means the cache is too small for the working set. Reset it with
   `reset_rebuild_count`.
 - Setting `PARDISO_MKL_JAX_STRICT_CACHE` turns any rebuild into an error that
-  names the token, so a lost factorization fails loudly instead of quietly
-  slowing things down. Leave it off in production and switch it on while
-  debugging performance.
+  names the token and says whether its slot was lost (evicted or freed) or holds
+  a different matrix (an aliased or stale token), so both a lost factorization
+  and a misused token fail loudly instead of quietly slowing things down or
+  rebuilding. Leave it off in production and switch it on while debugging
+  performance or a suspected aliasing bug.
 
 ### When is it safe to release explicitly?
 
@@ -261,7 +273,7 @@ matrix_type = pmj.MatrixType.REAL_NONSYMMETRIC
 token, _ = primitive.analyze(indptr, indices, values, matrix_type=matrix_type)
 token, _ = primitive.factor(token, indptr, indices, values, matrix_type=matrix_type)
 
-solution, _ = primitive.solve_stateful(
+solution, _, _ = primitive.solve_stateful(
     token, indptr, indices, values, right_hand_side[None, :], matrix_type=matrix_type
 )
 # Runs after the solve above, so it actually frees rather than costing a rebuild.
@@ -297,7 +309,7 @@ token, _ = primitive.factor(token, indptr, indices, values, matrix_type=matrix_t
 
 @jax.jit
 def solve_and_release(token, values, right_hand_side):
-    solution, _ = primitive.solve_stateful(
+    solution, _, _ = primitive.solve_stateful(
         token, indptr, indices, values, right_hand_side[None, :], matrix_type=matrix_type
     )
     primitive.release(token, dependency=solution)
@@ -631,6 +643,52 @@ The count is only meaningful after a call that actually factorized:
 After `analyze` or a `PardisoSolver.solve` it reports whatever the last
 factorization left behind. See
 [Re-analyzing in place](#re-analyzing-in-place) for the recovery path.
+
+### Rebuilds
+
+`rebuild_reason` reports whether a solve reused the cached factorization or had
+to rebuild it, as a [`RebuildReason`][pardiso_mkl_jax.RebuildReason] code:
+`NONE` when the cached factors were reused, `EVICTED_OR_RELEASED` when the slot
+was empty and rebuilt (the cache was too small, or the token was released), and
+`MATRIX_MISMATCH` when the slot held a factorization for a different matrix than
+the solve was given (an aliased handle or a stale token) and was rebuilt rather
+than used. It is the per-call counterpart to the process-wide
+[`rebuild_count`][pardiso_mkl_jax.rebuild_count]: the counter tells you a
+rebuild happened somewhere, this tells you it happened on this solve and why.
+
+It is only ever non-`NONE` for a stateful solve, the only call that reuses a
+cached factorization: `PardisoSolver.solve` and `refactor_and_solve`, and the
+`primitive.solve_stateful` / `factor_and_solve_stateful` they build on. Every
+other call, including the functional `solve`, factorizes from the values it was
+given and always reports `NONE`. Because `refactor_and_solve` always refactors,
+its only possible rebuild is a lost analysis (`EVICTED_OR_RELEASED`), never a
+mismatch.
+
+```python
+import jax
+
+jax.config.update("jax_enable_x64", True)
+
+import jax.numpy as jnp
+import pardiso_mkl_jax as pmj
+
+indptr = jnp.array([0, 2, 3, 4], dtype=jnp.int32)
+indices = jnp.array([0, 1, 1, 2], dtype=jnp.int32)
+values = jnp.array([4.0, 1.0, 3.0, 2.0], dtype=jnp.float64)
+right_hand_side = jnp.array([1.0, 2.0, 3.0], dtype=jnp.float64)
+
+with pmj.PardisoSolver(
+    indptr, indices, matrix_type=pmj.MatrixType.REAL_NONSYMMETRIC
+) as solver:
+    solver.analyze(values)
+    solver.factorize(values)
+    _solution, diagnostics = solver.solve(right_hand_side, return_diagnostics=True)
+    assert diagnostics.rebuild_reason == pmj.RebuildReason.NONE
+```
+
+Like every other field it is a scalar array, readable under `jit` through
+`return_diagnostics=True` (not `last_diagnostics`, which stays `None` there),
+and it gains a batch dimension under `vmap` the same way the rest do.
 
 ### Diagnostics under jit and vmap
 
