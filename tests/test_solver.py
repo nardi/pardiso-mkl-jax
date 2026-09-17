@@ -176,10 +176,10 @@ def test_whole_lifecycle_inside_jit_reuses_analysis(system):
 
     def run(values, other_values, right_hand_side):
         handle, _iparm = primitive.analyze(indptr, indices, values, matrix_type=matrix_type)
-        first, _iparm = primitive.factor_and_solve_stateful(
+        first, _iparm, _reason = primitive.factor_and_solve_stateful(
             handle, indptr, indices, values, right_hand_side[None, :], matrix_type=matrix_type
         )
-        second, _iparm = primitive.factor_and_solve_stateful(
+        second, _iparm, _reason = primitive.factor_and_solve_stateful(
             handle,
             indptr,
             indices,
@@ -214,7 +214,7 @@ def test_whole_lifecycle_inside_jit_does_not_leak_handles(system):
 
     def run(values, right_hand_side):
         handle, _iparm = primitive.analyze(indptr, indices, values, matrix_type=matrix_type)
-        solution, _iparm = primitive.factor_and_solve_stateful(
+        solution, _iparm, _reason = primitive.factor_and_solve_stateful(
             handle, indptr, indices, values, right_hand_side[None, :], matrix_type=matrix_type
         )
         # Tracking the solution forces release() to run after the solve above,
@@ -235,9 +235,9 @@ def test_whole_lifecycle_inside_jit_does_not_leak_handles(system):
         # handle it does not recognize.
         assert _ffi.analysis_count(handle.id) == 0
 
-    # A fresh handle is allocated on every call, never reused while a prior
-    # one might still be referenced.
-    assert len(handles_seen) == 10
+    # The handle is content-addressed, so the same matrix names one handle
+    # across every call rather than a fresh id each time.
+    assert len(handles_seen) == 1
 
 
 def test_many_create_close_cycles_do_not_leak(system):
@@ -259,12 +259,13 @@ def handle_value(solver) -> int:
     return int(solver._handle.id)
 
 
-def test_analyze_again_reanalyzes_in_place(system):
-    """A second analyze() reuses the handle instead of allocating another one.
+def test_analyze_again_takes_a_fresh_handle(system):
+    """A second analyze() retires the old handle and takes a fresh one.
 
-    The point of re-analysis: a caller recovering from a bad factorization can
-    redo the symbolic phase without ending up holding two handles and having
-    to free the old one conditionally.
+    Handles are content-addressed, so re-analyzing for different values names a
+    different matrix and the solver moves to a new handle. The old one is
+    retired rather than reused, so the caller never holds two live analyses, and
+    a factorize and solve on the new values are correct.
     """
     matrix_type, indptr, indices, values, dense, right_hand_side = system
     with pmj.PardisoSolver(
@@ -276,8 +277,11 @@ def test_analyze_again_reanalyzes_in_place(system):
 
         new_values = values * 2.0
         solver.analyze(jnp.asarray(new_values))
-        assert handle_value(solver) == first_handle
-        assert _ffi.analysis_count(first_handle) == 2
+        second_handle = handle_value(solver)
+        assert second_handle != first_handle
+        # The old handle is retired, and the new one carries its own analysis.
+        assert _ffi.analysis_count(first_handle) == 0
+        assert _ffi.analysis_count(second_handle) == 1
 
         solver.factorize(jnp.asarray(new_values))
         solution = solver.solve(jnp.asarray(right_hand_side))
@@ -307,22 +311,23 @@ def test_reanalysis_discards_the_factorization(any_system):
         solver.solve(jnp.asarray(right_hand_side))
 
 
-def test_repeated_reanalysis_does_not_leak(any_system):
-    """Twenty re-analyses on one solver stay on one handle and keep solving correctly."""
+def test_repeated_reanalysis_stays_correct(any_system):
+    """Twenty analyze/factorize/solve cycles on one solver keep solving correctly.
+
+    Each analyze() retires the previous handle and takes a fresh
+    content-addressed one, so the registry does not grow without end across the
+    cycles.
+    """
     indptr, indices, values, dense, right_hand_side = any_system
     expected = np.linalg.solve(dense, right_hand_side)
     with pmj.PardisoSolver(
         jnp.asarray(indptr), jnp.asarray(indices), matrix_type=pmj.MatrixType.REAL_NONSYMMETRIC
     ) as solver:
-        solver.analyze(jnp.asarray(values))
-        handle = handle_value(solver)
         for _ in range(20):
             solver.analyze(jnp.asarray(values))
             solver.factorize(jnp.asarray(values))
             solution = solver.solve(jnp.asarray(right_hand_side))
             np.testing.assert_allclose(np.asarray(solution), expected, rtol=1e-8, atol=1e-10)
-        assert handle_value(solver) == handle
-        assert _ffi.analysis_count(handle) == 21
 
 
 def test_reanalyze_primitive_inside_and_outside_jit(system):
@@ -346,7 +351,7 @@ def test_reanalyze_primitive_inside_and_outside_jit(system):
         handle, _iparm = primitive.factor(
             handle, indptr, indices, second_values, matrix_type=matrix_type
         )
-        solution, _iparm = primitive.solve_stateful(
+        solution, _iparm, _reason = primitive.solve_stateful(
             handle,
             indptr,
             indices,
@@ -360,10 +365,11 @@ def test_reanalyze_primitive_inside_and_outside_jit(system):
     traced, traced_handle = jax.jit(run)(*arguments)
     eager, eager_handle = run(*arguments)
 
-    # Two analyses ran on each handle, so the re-analysis was neither dropped
-    # nor reordered ahead of the analyze that created the entry.
-    assert _ffi.analysis_count(traced_handle.id) == 2
-    assert _ffi.analysis_count(eager_handle.id) == 2
+    # The surviving factorization carries exactly one analysis. The traced and
+    # eager results agreeing with the dense solve below is what shows the
+    # re-analysis was neither dropped nor reordered.
+    assert _ffi.analysis_count(traced_handle.id) == 1
+    assert _ffi.analysis_count(eager_handle.id) == 1
     primitive.release(traced_handle)
     primitive.release(eager_handle)
 
@@ -396,7 +402,7 @@ def test_reanalyze_rebuilds_an_evicted_handle(any_system):
 
     handle, _iparm = primitive.factor(handle, indptr, indices, values, matrix_type=matrix_type)
     stacked_rhs = jnp.asarray(right_hand_side)[None, :]
-    solution, _iparm = primitive.solve_stateful(
+    solution, _iparm, _reason = primitive.solve_stateful(
         handle, indptr, indices, values, stacked_rhs, matrix_type=matrix_type
     )
     primitive.release(handle)
