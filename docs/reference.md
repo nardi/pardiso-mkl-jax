@@ -28,6 +28,14 @@
 
 ::: pardiso_mkl_jax.reset_rebuild_count
 
+## `rebuild_stats`
+
+::: pardiso_mkl_jax.rebuild_stats
+
+## `RebuildReason`
+
+::: pardiso_mkl_jax.RebuildReason
+
 ## `FactorizationToken`
 
 ::: pardiso_mkl_jax.FactorizationToken

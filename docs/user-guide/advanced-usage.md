@@ -9,8 +9,7 @@ into separate calls, so you control exactly what work happens on each one:
 - `analyze(values)` runs the symbolic analysis (fill-reducing ordering) for
   the sparsity pattern. This is the expensive step you want to avoid
   repeating, and needs to run only once per pattern. Calling it again
-  re-analyzes in place, see [Re-analyzing in place](#re-analyzing-in-place)
-  below.
+  redoes the analysis, see [Re-analyzing](#re-analyzing) below.
 - `factorize(values)` runs the first numeric factorization, and requires a
   prior `analyze()`.
 - `refactorize(values)` updates the numeric factorization for new values on
@@ -60,14 +59,14 @@ with pmj.PardisoSolver(
     third = solver.solve(jnp.array([1.0, 2.0, 3.0], dtype=jnp.float64))
 ```
 
-## Re-analyzing in place
+## Re-analyzing
 
 Calling `analyze()` a second time on the same solver redoes the symbolic
-phase on the handle the solver already holds. The existing factorization is
-freed first, and no second handle is allocated, so there is nothing extra to
-release. This is the recovery path for a factorization that came back
-unusable: re-analyze with different settings and try again, without having to
-build a second solver and free the first one conditionally.
+phase. The old handle is retired and the solver takes a fresh
+content-addressed one, and the existing factorization is gone. This is the
+recovery path for a factorization that came back unusable: re-analyze with
+different settings and try again, without having to build a second solver and
+free the first one conditionally.
 
 Because the re-analysis discards the factorization, `factorize()` has to run
 again before the next `solve()`. Calling `solve()` or `refactorize()` in
@@ -94,8 +93,8 @@ with pmj.PardisoSolver(
     diagnostics = solver.factorize(values, return_diagnostics=True)
 
     if diagnostics.perturbed_pivot_count > 0:
-        # Pardiso could not pivot cleanly. Re-analyze on the same handle with
-        # matching disabled, then factorize again.
+        # Pardiso could not pivot cleanly. Re-analyze with matching disabled,
+        # then factorize again.
         solver.analyze(values, options={PardisoOption.WEIGHTED_MATCHING: 0})
         solver.factorize(values, options={PardisoOption.WEIGHTED_MATCHING: 0})
 
@@ -114,8 +113,8 @@ orders the re-analysis against the calls around it by data dependency.
 ## Composing inside jax.jit
 
 A `PardisoSolver`'s factorization is identified by a token, a small bundle
-carrying an `int64` cache id, threaded through `analyze`, `factor`, `solve`, and
-`release` under the hood. Once a solver has
+carrying a `uint64` content-hash id, threaded through `analyze`, `factor`,
+`solve`, and `release` under the hood. Once a solver has
 been analyzed, `refactor_and_solve` and `solve` can be called any number of
 times entirely inside a jitted function, with the analysis reused across
 calls:
@@ -184,7 +183,7 @@ right_hand_side = jnp.array([1.0, 2.0, 3.0], dtype=jnp.float64)
 matrix_type = pmj.MatrixType.REAL_NONSYMMETRIC
 
 token, _final_iparm = primitive.analyze(indptr, indices, values, matrix_type=matrix_type)
-solution, final_iparm = primitive.factor_and_solve_stateful(
+solution, final_iparm, rebuild_reason = primitive.factor_and_solve_stateful(
     token, indptr, indices, values, right_hand_side[None, :], matrix_type=matrix_type
 )
 primitive.release(token)
@@ -204,8 +203,10 @@ below.
 
 ## Memory and the handle cache
 
-A token's cache id is not a raw pointer. It is a key into a process-wide cache of
-factorizations, and this is what makes the token API memory-safe:
+A token's cache id is not a raw pointer. It is a content hash of the matrix and
+options, and the id is a key into a process-wide cache of factorizations. The
+cache is memoization, not correctness, and that is what makes the token API
+memory-safe:
 
 - **Forgetting to release leaks a bounded amount.** The cache holds a fixed
   number of factorizations, eight by default. Once it is full the
@@ -216,19 +217,34 @@ factorizations, and this is what makes the token API memory-safe:
   the matrix it needs, so a call that lands on a token no longer in the cache
   rebuilds its factorization on the spot and continues. The answer is the same,
   it just costs the rebuild.
+- **Identical matrices share one factorization.** Two tokens for the same matrix
+  and options hash equal, so they name one cache entry rather than two. A
+  `refactorize` for new values takes a new content id and retires the old one,
+  so a stale alias of the pre-refactor token still names the original matrix and
+  rebuilds it if used.
 
 Rebuilds are correct but not free, so a program that keeps more factorizations
-live than the cache holds pays to rebuild them over and over. Two tools help
+live than the cache holds pays to rebuild them over and over. Three tools help
 find that:
 
 - [`pardiso_mkl_jax.rebuild_count`][pardiso_mkl_jax.rebuild_count] returns how
   many rebuilds have happened. A count that climbs during steady-state solving
   means the cache is too small for the working set. Reset it with
   `reset_rebuild_count`.
+- [`pardiso_mkl_jax.rebuild_stats`][pardiso_mkl_jax.rebuild_stats] breaks that
+  total down by reason. A rising `SUPERSEDED` points at stale-alias use, a
+  rising `EVICTED` at cache pressure.
 - Setting `PARDISO_MKL_JAX_STRICT_CACHE` turns any rebuild into an error that
   names the token, so a lost factorization fails loudly instead of quietly
   slowing things down. Leave it off in production and switch it on while
   debugging performance.
+
+The `solve` and `refactor_and_solve` methods, and the low-level
+`solve_stateful` and `factor_and_solve_stateful` primitives, report per call
+whether they reused a cached factorization or rebuilt one. The reason is a
+[`RebuildReason`][pardiso_mkl_jax.RebuildReason] carried on the
+call's [`PardisoDiagnostics`][pardiso_mkl_jax.PardisoDiagnostics] as
+`rebuild_reason`, so you can branch on it under `jax.jit`.
 
 ### When is it safe to release explicitly?
 
@@ -261,7 +277,7 @@ matrix_type = pmj.MatrixType.REAL_NONSYMMETRIC
 token, _ = primitive.analyze(indptr, indices, values, matrix_type=matrix_type)
 token, _ = primitive.factor(token, indptr, indices, values, matrix_type=matrix_type)
 
-solution, _ = primitive.solve_stateful(
+solution, _, _ = primitive.solve_stateful(
     token, indptr, indices, values, right_hand_side[None, :], matrix_type=matrix_type
 )
 # Runs after the solve above, so it actually frees rather than costing a rebuild.
@@ -297,7 +313,7 @@ token, _ = primitive.factor(token, indptr, indices, values, matrix_type=matrix_t
 
 @jax.jit
 def solve_and_release(token, values, right_hand_side):
-    solution, _ = primitive.solve_stateful(
+    solution, _, _ = primitive.solve_stateful(
         token, indptr, indices, values, right_hand_side[None, :], matrix_type=matrix_type
     )
     primitive.release(token, dependency=solution)

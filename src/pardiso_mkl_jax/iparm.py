@@ -18,6 +18,7 @@ from collections.abc import Iterable, Mapping
 from typing import cast
 
 import jax
+import jax.numpy as jnp
 import numpy as np
 
 
@@ -367,9 +368,22 @@ class PardisoDiagnostics:
     raw: jax.Array
     """All 64 iparm entries, for anything not decoded into a named field above."""
 
+    rebuild_reason: jax.Array
+    """Whether the solve reused a cached factorization or rebuilt one, as a
+    RebuildReason value (see pardiso_mkl_jax.primitive). NONE (0) on a cache hit,
+    and on calls where the question does not apply (analyze, factor, and the
+    functional solve, which never reuses a factorization)."""
+
     @staticmethod
-    def from_iparm(iparm: jax.Array) -> PardisoDiagnostics:
-        """Decode a final iparm array (shape (..., 64)) into a PardisoDiagnostics."""
+    def from_iparm(iparm: jax.Array, rebuild_reason: jax.Array | None = None) -> PardisoDiagnostics:
+        """Decode a final iparm array (shape (..., 64)) into a PardisoDiagnostics.
+
+        rebuild_reason is the per-call RebuildReason from a stateful solve. When
+        it is not given, it defaults to NONE (0), broadcast to iparm's batch
+        shape, for calls where a cache hit or miss does not apply.
+        """
+        if rebuild_reason is None:
+            rebuild_reason = jnp.zeros(iparm.shape[:-1], dtype=jnp.int32)
         return PardisoDiagnostics(
             refinement_steps_performed=iparm[..., 6],
             perturbed_pivot_count=iparm[..., 13],
@@ -384,4 +398,5 @@ class PardisoDiagnostics:
             zero_or_negative_pivot_position=iparm[..., 29],
             min_out_of_core_memory_kb=iparm[..., 62],
             raw=iparm,
+            rebuild_reason=rebuild_reason,
         )
