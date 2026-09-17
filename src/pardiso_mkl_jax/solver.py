@@ -32,8 +32,8 @@ class PardisoSolver:
     control exactly what work happens on each one:
 
     - analyze() runs the symbolic phase for the pattern. Calling it again on
-      the same solver re-analyzes in place, freeing the numeric factorization
-      and reusing the same native handle rather than allocating a second one.
+      the same solver redoes the analysis, retiring the old handle and taking a
+      fresh content-addressed one, and the numeric factorization is gone.
     - factorize() runs the first numeric factorization, and requires a prior
       analyze().
     - refactorize() updates the numeric factorization for new values on the
@@ -174,16 +174,18 @@ class PardisoSolver:
                     "applies to every call, or re-run analyze() with the new value."
                 )
 
-    def _record_diagnostics(self, final_iparm) -> PardisoDiagnostics:
+    def _record_diagnostics(self, final_iparm, rebuild_reason=None) -> PardisoDiagnostics:
         """Decode diagnostics, store them on the solver, and return them.
 
-        Stores None instead when final_iparm is a tracer, which it is whenever
-        the call is running under jit. Keeping the decoded tracer would leak
-        it out of its trace, so reading last_diagnostics afterwards would
-        raise rather than return anything useful. The returned value is the
-        real one either way, so return_diagnostics still works under jit.
+        rebuild_reason is the per-call RebuildReason from a stateful solve, or
+        None for calls where a cache hit or miss does not apply. Stores None on
+        the solver instead when final_iparm is a tracer, which it is whenever
+        the call is running under jit. Keeping the decoded tracer would leak it
+        out of its trace, so reading last_diagnostics afterwards would raise
+        rather than return anything useful. The returned value is the real one
+        either way, so return_diagnostics still works under jit.
         """
-        diagnostics = PardisoDiagnostics.from_iparm(final_iparm)
+        diagnostics = PardisoDiagnostics.from_iparm(final_iparm, rebuild_reason)
         self._last_diagnostics = None if isinstance(final_iparm, jax.core.Tracer) else diagnostics
         return diagnostics
 
@@ -222,12 +224,11 @@ class PardisoSolver:
         produces stay valid for a later factorize() call with different
         values on the same pattern, so this only needs to run once.
 
-        Calling it again on the same solver re-analyzes in place: the existing
-        numeric factorization is freed and the same native handle is reused,
-        so no second handle is allocated and nothing extra needs releasing.
-        factorize() must run again afterwards before any solve(), since the
-        factorization the re-analysis discarded is the one solve() would have
-        used.
+        Calling it again on the same solver redoes the analysis: the old handle
+        is retired and a fresh content-addressed one takes its place, and the
+        numeric factorization is gone. factorize() must run again afterwards
+        before any solve(), since the factorization the re-analysis discarded is
+        the one solve() would have used.
 
         Must be called outside jit. It stores the native handle on the solver,
         and under jit that handle is a tracer, which would escape its trace.
@@ -375,7 +376,7 @@ class PardisoSolver:
         overlay = self._merge(options)
         self._check_pivot_settings(overlay, "solve()")
         stacked_right_hand_side = right_hand_side[None, :]
-        solution, final_iparm = primitive.solve_stateful(
+        solution, final_iparm, rebuild_reason = primitive.solve_stateful(
             self._handle,
             self._indptr,
             self._indices,
@@ -385,7 +386,7 @@ class PardisoSolver:
             transpose=transpose,
             options=overlay,
         )
-        diagnostics = self._record_diagnostics(final_iparm)
+        diagnostics = self._record_diagnostics(final_iparm, rebuild_reason)
         if return_diagnostics:
             return solution[0], diagnostics
         return solution[0]
@@ -422,7 +423,7 @@ class PardisoSolver:
         overlay = self._merge(options)
         self._check_pivot_settings(overlay, "refactor_and_solve()")
         stacked_right_hand_side = right_hand_side[None, :]
-        solution, final_iparm = primitive.factor_and_solve_stateful(
+        solution, final_iparm, rebuild_reason = primitive.factor_and_solve_stateful(
             self._handle,
             self._indptr,
             self._indices,
@@ -433,5 +434,5 @@ class PardisoSolver:
             options=overlay,
         )
         if return_diagnostics:
-            return solution[0], PardisoDiagnostics.from_iparm(final_iparm)
+            return solution[0], PardisoDiagnostics.from_iparm(final_iparm, rebuild_reason)
         return solution[0]
