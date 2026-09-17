@@ -27,6 +27,7 @@ _pardiso_ffi.cc for the full explanation.
 
 from __future__ import annotations
 
+import enum
 import functools
 
 import jax
@@ -76,6 +77,27 @@ def default_iparm(matrix_type: MatrixType) -> np.ndarray:
     return defaults
 
 
+class RebuildReason(enum.IntEnum):
+    """Why a token use rebuilt its factorization instead of reusing a cached one.
+
+    NONE is a cache hit, the resident factorization was used. The others say how
+    the cache entry was retired before the use reached it: EVICTED fell out of
+    the bounded cache, FREED was released, SUPERSEDED was re-keyed by a refactor
+    so a stale alias was used, and UNKNOWN was never resident or its tombstone
+    aged out. DTYPE and STALE are reserved so the numbering matches
+    splineax-klujax. solve_stateful and factor_and_solve_stateful return one per
+    call, and rebuild_stats totals them.
+    """
+
+    NONE = 0
+    EVICTED = 1
+    FREED = 2
+    SUPERSEDED = 3
+    DTYPE = 4
+    UNKNOWN = 5
+    STALE = 6
+
+
 def rebuild_count() -> int:
     """Number of factorization rebuilds since load or the last reset.
 
@@ -89,8 +111,17 @@ def rebuild_count() -> int:
 
 
 def reset_rebuild_count() -> None:
-    """Reset the rebuild counter to zero."""
+    """Reset the rebuild counter to zero, per-reason totals included."""
     _ffi.reset_rebuild_count()
+
+
+def rebuild_stats() -> dict[RebuildReason, int]:
+    """Per-reason rebuild totals since load or the last reset.
+
+    A rising SUPERSEDED points at stale-alias use, a rising EVICTED at cache
+    pressure. See RebuildReason.
+    """
+    return {reason: int(_ffi.rebuild_reason_count(int(reason))) for reason in RebuildReason}
 
 
 def _overlay_buffers(options: OptionsLike) -> tuple[jax.Array, jax.Array]:
@@ -157,31 +188,30 @@ def _ordering_operand(token, dependency):
 
 
 def analyze(indptr, indices, values, *, matrix_type: MatrixType, options: OptionsLike = None):
-    """Run the analyze (phase 11) step and allocate a fresh native factorization.
+    """Run the analyze (phase 11) step and return a content-addressed token.
 
-    Returns (token, final_iparm). The token is a FactorizationToken carrying
-    the native factorization's cache id, which every later call (factor,
+    Returns (token, final_iparm). The token is a FactorizationToken whose id is
+    a content hash of the matrix and options, which every later call (factor,
     solve_stateful, factor_and_solve_stateful, release) takes as an input.
-    Threading the id as data, rather than addressing the native state by
-    a Python-side id, is what lets XLA order the whole
+    Threading the id as data is what lets XLA order the whole
     analyze-factor-solve-release lifecycle and lets it run inside a jitted
     function. final_iparm is the complete iparm array as Pardiso left it, for
     decoding into a PardisoDiagnostics.
 
-    Every call allocates a new factorization. To redo the analysis for a
-    token that already has one, use reanalyze instead, which reuses the
-    id rather than leaving the old one for the caller to release.
+    This call carries no side effect, so XLA may drop or merge it. Two identical
+    analyze calls hash equal and share one cache entry. To redo the analysis for
+    a new pattern, values, or overlay, use reanalyze, which retires the old
+    token.
     """
     dimension = indptr.shape[0] - 1
     overlay_mask, overlay_values = _overlay_buffers(options)
     handle, _status, final_iparm = jax.ffi.ffi_call(
         "pardiso_mkl_jax_analyze",
         (
-            jax.ShapeDtypeStruct((), jnp.int64),
+            jax.ShapeDtypeStruct((), jnp.uint64),
             jax.ShapeDtypeStruct((), jnp.int32),
             jax.ShapeDtypeStruct((64,), jnp.int32),
         ),
-        has_side_effect=True,
     )(
         indptr,
         indices,
@@ -197,32 +227,29 @@ def analyze(indptr, indices, values, *, matrix_type: MatrixType, options: Option
 def reanalyze(
     token, indptr, indices, values, *, matrix_type: MatrixType, options: OptionsLike = None
 ):
-    """Re-run the analyze (phase 11) step in place on an existing token.
+    """Re-run the analyze (phase 11) step, retiring the input token.
 
-    Frees the factorization currently held for the token and runs a fresh
-    symbolic analysis into the same native state, so this is how a caller
-    redoes the analysis (for a new sparsity-compatible pattern, different
-    values, or a different overlay) without ending up holding two ids.
-    Returns (token, final_iparm) with the id unchanged, which keeps later
-    calls ordered against it by data dependency exactly as factor does. The
-    returned token's solve counter is reset to zero.
+    Redoes the symbolic analysis for a new pattern, values, or overlay and
+    returns a fresh content-addressed token for it. The input token is retired,
+    so a caller never ends up holding two live analyses for the same solver.
+    Returns (token, final_iparm) with the new id. The returned token's solve
+    counter is reset to zero.
 
     The numeric factorization is gone afterwards, so factor must run again
-    before any solve. If the id was evicted or released, this rebuilds it
-    from scratch instead of raising, the same self-healing behavior every
-    other stateful call has (see rebuild_count). Set
-    PARDISO_MKL_JAX_STRICT_CACHE to turn that rebuild into an error instead.
+    before any solve. If the input token was evicted or released, this counts a
+    rebuild rather than raising, the same self-healing behavior every other call
+    has (see rebuild_count). Set PARDISO_MKL_JAX_STRICT_CACHE to turn that into
+    an error instead.
     """
     dimension = indptr.shape[0] - 1
     overlay_mask, overlay_values = _overlay_buffers(options)
     handle_out, _status, final_iparm = jax.ffi.ffi_call(
         "pardiso_mkl_jax_reanalyze",
         (
-            jax.ShapeDtypeStruct((), jnp.int64),
+            jax.ShapeDtypeStruct((), jnp.uint64),
             jax.ShapeDtypeStruct((), jnp.int32),
             jax.ShapeDtypeStruct((64,), jnp.int32),
         ),
-        has_side_effect=True,
     )(
         token.id,
         indptr,
@@ -239,9 +266,12 @@ def reanalyze(
 def factor(token, indptr, indices, values, *, matrix_type: MatrixType, options: OptionsLike = None):
     """Run the numeric factorization (phase 22) step against token.
 
-    Returns (token, final_iparm). The id comes back unchanged, so a
-    later call that consumes this function's returned token is ordered after
-    the factorization it performed. The returned token's solve counter is
+    Returns (new_token, final_iparm). The returned token's id is a content hash
+    of the factorization, distinct from the analyze token's id, so a later call
+    that consumes it is ordered after the factorization it performed. When the
+    analyze token is still resident, its analysis is reused and re-keyed to the
+    new token. When it is gone, the whole analyze then factor chain is rebuilt
+    from the matrix this call carries. The returned token's solve counter is
     reset to zero. final_iparm is the complete iparm array as Pardiso left it,
     for decoding into a PardisoDiagnostics.
     """
@@ -250,11 +280,10 @@ def factor(token, indptr, indices, values, *, matrix_type: MatrixType, options: 
     handle_out, _status, final_iparm = jax.ffi.ffi_call(
         "pardiso_mkl_jax_factor",
         (
-            jax.ShapeDtypeStruct((), jnp.int64),
+            jax.ShapeDtypeStruct((), jnp.uint64),
             jax.ShapeDtypeStruct((), jnp.int32),
             jax.ShapeDtypeStruct((64,), jnp.int32),
         ),
-        has_side_effect=True,
     )(
         token.id,
         indptr,
@@ -290,8 +319,8 @@ def _make_solve_stateful_core(
             (
                 jax.ShapeDtypeStruct(right_hand_side.shape, jnp.float64),
                 jax.ShapeDtypeStruct((64,), jnp.int32),
+                jax.ShapeDtypeStruct((), jnp.int32),
             ),
-            has_side_effect=True,
         )(
             token_id,
             indptr,
@@ -325,19 +354,20 @@ def _make_solve_stateful_core(
         if rhs_batched:
             # Fuse the batch dim into Pardiso's multi-RHS support.
             # rhs shape is (batch, num_rhs, n), reshape to (batch*num_rhs, n)
-            # so Pardiso solves all of them in one native call.
+            # so Pardiso solves all of them in one native call. That single call
+            # reports one rebuild reason, so it stays unbatched.
             original_shape = right_hand_side.shape
             fused = right_hand_side.reshape(-1, original_shape[-1])
-            solution, final_iparm = solve_stateful_core(
+            solution, final_iparm, rebuild_reason = solve_stateful_core(
                 token_id, indptr, indices, values, fused
             )
             solution = solution.reshape(original_shape)
-            return (solution, final_iparm), (True, False)
+            return (solution, final_iparm, rebuild_reason), (True, False, False)
 
         # Nothing batched. custom_vmap can still reach here if unrelated
         # arguments elsewhere in a larger vmapped computation were batched.
         result = solve_stateful_core(token_id, indptr, indices, values, right_hand_side)
-        return result, (False, False)
+        return result, (False, False, False)
 
     return solve_stateful_core
 
@@ -357,9 +387,11 @@ def solve_stateful(
 
     transpose solves A^T x = right_hand_side instead of A x = right_hand_side,
     reusing the same factorization. No call to factor() is needed to switch
-    between the two for a given token. Returns (solution, final_iparm), the
-    latter for decoding into a PardisoDiagnostics. To order a later release
-    after this solve, pass the solution to token.track (see release).
+    between the two for a given token. Returns (solution, final_iparm,
+    rebuild_reason). final_iparm decodes into a PardisoDiagnostics, and
+    rebuild_reason is a RebuildReason saying whether the factorization was a
+    cache hit or was rebuilt. To order a later release after this solve, pass
+    the solution to token.track (see release).
     """
     overlay_key = canonicalize_overlay(options)
     core = _make_solve_stateful_core(MatrixType(matrix_type), transpose, overlay_key)
@@ -386,8 +418,8 @@ def _make_factor_and_solve_stateful_core(
             (
                 jax.ShapeDtypeStruct(right_hand_side.shape, jnp.float64),
                 jax.ShapeDtypeStruct((64,), jnp.int32),
+                jax.ShapeDtypeStruct((), jnp.int32),
             ),
-            has_side_effect=True,
         )(
             token_id,
             indptr,
@@ -415,32 +447,38 @@ def _make_factor_and_solve_stateful_core(
 
         if not values_batched and rhs_batched:
             # Fuse the batch dim into Pardiso's multi-RHS support.
-            # Phase 23 factors once and solves all RHS in one native call.
+            # Phase 23 factors once and solves all RHS in one native call, so it
+            # reports one rebuild reason.
             original_shape = right_hand_side.shape
             fused = right_hand_side.reshape(-1, original_shape[-1])
-            solution, final_iparm = factor_and_solve_core(
+            solution, final_iparm, rebuild_reason = factor_and_solve_core(
                 token_id, indptr, indices, values, fused
             )
             solution = solution.reshape(original_shape)
-            return (solution, final_iparm), (True, False)
+            return (solution, final_iparm, rebuild_reason), (True, False, False)
 
         if values_batched:
             # Each batch element needs its own numeric factorization, but
             # they share the analysis behind token_id. Loop and call phase
-            # 23 per element, then stack.
+            # 23 per element, then stack. Each element reports its own reason.
             solutions = []
             iparms = []
+            reasons = []
             for i in range(axis_size):
                 current_rhs = right_hand_side[i] if rhs_batched else right_hand_side
-                sol, iparm = factor_and_solve_core(
+                sol, iparm, reason = factor_and_solve_core(
                     token_id, indptr, indices, values[i], current_rhs
                 )
                 solutions.append(sol)
                 iparms.append(iparm)
-            return (jnp.stack(solutions), jnp.stack(iparms)), (True, True)
+                reasons.append(reason)
+            return (
+                (jnp.stack(solutions), jnp.stack(iparms), jnp.stack(reasons)),
+                (True, True, True),
+            )
 
         result = factor_and_solve_core(token_id, indptr, indices, values, right_hand_side)
-        return result, (False, False)
+        return result, (False, False, False)
 
     return factor_and_solve_core
 
@@ -462,8 +500,12 @@ def factor_and_solve_stateful(
     given values against the stored analysis. This is a single FFI call, so the
     factorization and the solve stay ordered under jit, unlike a factor()
     followed by a separate solve_stateful(). Those share no data dependency XLA
-    must honor, so the solve could otherwise run before the factor. Returns
-    (solution, final_iparm), the latter for decoding into a PardisoDiagnostics.
+    must honor, so the solve could otherwise run before the factor. Unlike
+    factor, this reuses the analysis token in place without retiring it, so the
+    same token stays usable across many calls. Returns (solution, final_iparm,
+    rebuild_reason). final_iparm decodes into a PardisoDiagnostics, and
+    rebuild_reason is a RebuildReason saying whether the analysis was reused or
+    rebuilt.
     """
     overlay_key = canonicalize_overlay(options)
     core = _make_factor_and_solve_stateful_core(MatrixType(matrix_type), transpose, overlay_key)
@@ -641,7 +683,7 @@ def _make_solve_core(
                         if right_hand_side_batched
                         else right_hand_side[None, :]
                     )
-                    solution, final_iparm = solve_stateful(
+                    solution, final_iparm, _reason = solve_stateful(
                         handle,
                         indptr,
                         indices,

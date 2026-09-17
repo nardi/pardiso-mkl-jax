@@ -24,10 +24,11 @@ cdef extern from "_pardiso_ffi.h":
     void* pardiso_release_handler_address()
     void* pardiso_solve_once_handler_address()
     void pardiso_default_iparm(long matrix_type, int32_t* out)
-    long pardiso_analysis_count(long handle)
-    void pardiso_reset_analysis_count(long handle)
+    long pardiso_analysis_count(unsigned long long handle)
+    void pardiso_reset_analysis_count(unsigned long long handle)
     long pardiso_rebuild_count()
     void pardiso_reset_rebuild_count()
+    long pardiso_rebuild_reason_count(int reason)
 
 
 cdef object _capsule(void* address):
@@ -106,5 +107,10 @@ def rebuild_count():
 
 
 def reset_rebuild_count():
-    """Reset the rebuild counter to zero."""
+    """Reset the rebuild counter to zero, per-reason totals included."""
     pardiso_reset_rebuild_count()
+
+
+def rebuild_reason_count(reason):
+    """Number of rebuilds recorded for one RebuildReason since the last reset."""
+    return pardiso_rebuild_reason_count(int(reason))

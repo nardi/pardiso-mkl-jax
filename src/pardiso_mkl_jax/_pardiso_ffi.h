@@ -10,20 +10,19 @@
 
 extern "C" {
 
-// Stateful handler for the analyze step (phase 11). Allocates a fresh
-// registry entry and returns its key as an int64 handle value, which every
-// later stage threads through as ordinary data.
+// Handler for the analyze step (phase 11). Returns a content-hash handle for
+// the matrix, which every later stage threads through as ordinary data. Pure:
+// two identical analyze calls dedup to one cache entry.
 void* pardiso_analyze_handler_address();
 
-// Stateful handler that re-runs the analyze step (phase 11) in place on a
-// handle an earlier analyze already allocated, freeing the existing
-// factorization first. Returns the same handle, so no second registry entry
-// is created and nothing extra needs freeing.
+// Handler that re-runs the analyze step (phase 11) for a possibly new matrix
+// or options, retiring the old handle and returning the content-hash handle of
+// the new analysis. The numeric factorization is gone afterwards.
 void* pardiso_reanalyze_handler_address();
 
-// Stateful handler for the numeric factorization step (phase 22). Takes the
-// handle returned by analyze and passes it through unchanged, so a
-// downstream solve that consumes this handler's output is ordered after it.
+// Handler for the numeric factorization step (phase 22). Takes an analyze
+// handle and returns a distinct factor-domain handle naming the factorization
+// of these values, so a downstream solve that consumes it is ordered after it.
 void* pardiso_factor_handler_address();
 
 // Stateful handler for the solve step (phase 33), run against a
@@ -51,14 +50,18 @@ void pardiso_default_iparm(long matrix_type, int32_t* out);
 
 // Read and reset the analysis call counter for a handle. Used by tests to
 // assert that a reused factorization does not re-run the symbolic phase.
-long pardiso_analysis_count(long handle);
-void pardiso_reset_analysis_count(long handle);
+long pardiso_analysis_count(unsigned long long handle);
+void pardiso_reset_analysis_count(unsigned long long handle);
 
 // Read and reset the process-wide rebuild counter. It rises whenever a call
 // lands on an evicted or freed handle and rebuilds the factorization, so a
-// rising count is the signal that the cache is too small.
+// rising count is the signal that the cache is too small. Resetting also
+// clears the per-reason totals.
 long pardiso_rebuild_count();
 void pardiso_reset_rebuild_count();
+
+// Per-reason rebuild total, indexed by RebuildReason, for rebuild_stats().
+long pardiso_rebuild_reason_count(int reason);
 
 }  // extern "C"
 

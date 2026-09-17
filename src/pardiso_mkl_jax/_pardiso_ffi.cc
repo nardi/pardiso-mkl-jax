@@ -1,16 +1,21 @@
 // XLA FFI handlers wrapping the oneMKL Pardiso direct sparse solver.
 //
 // Pardiso keeps its factorization in an opaque native handle ("pt") that
-// must persist across calls to be reused. XLA FFI calls are stateless from
-// JAX's point of view, so we keep a process-global registry mapping an
-// integer key to the native state. That key is itself threaded through JAX
-// as an ordinary int64 array value ("the handle"): analyze allocates a fresh
-// key and returns it, factor and solve take it as an input, and release
-// consumes it. Because every stage takes the previous stage's handle as
-// data, XLA orders the whole analyze -> factor -> solve -> release lifecycle
-// by data dependency, the same way it orders any other computation, so the
-// lifecycle can be expressed entirely inside a jit trace and each runtime
-// invocation of a compiled function gets its own registry entry.
+// must persist across calls to be reused. XLA cannot hold that object in a
+// buffer, so we keep a process-global cache of them. A handle is a content
+// hash of the matrix it names (matrix type, dimension, sparsity pattern,
+// values, options), never a raw pointer, so whatever the cache returns for a
+// key was built from content whose hash is that key. A handle names a matrix,
+// not a mutable slot.
+//
+// This makes the cache a memoization layer, not part of correctness. A call
+// that arrives with a key no longer resident rebuilds the factorization from
+// the arrays the call carries, so a stale handle is always safe. A refactor
+// re-keys to the new values instead of overwriting the old key, so a stale
+// alias of the old handle still names the original matrix and rebuilds it. At
+// worst a call redoes the whole analyze then factor chain. Because a handle is
+// a pure function of the inputs, analyze and factor carry no side effect, and
+// XLA may eliminate, reorder, or merge them.
 //
 // All buffers are read directly from the pointers XLA hands us. There is no
 // copying: the CSR arrays and right-hand sides passed in from Python flow
@@ -37,9 +42,9 @@
 #include <cstdlib>
 #include <cstring>
 #include <list>
+#include <map>
 #include <mutex>
 #include <string>
-#include <unordered_map>
 
 #include "xla/ffi/api/ffi.h"
 
@@ -48,15 +53,39 @@ namespace ffi = xla::ffi;
 namespace pardiso_mkl_jax {
 namespace {
 
-// Native state for one handle: the opaque Pardiso handle, its parameter
-// array, and a little bookkeeping used by tests to check that analysis is
-// only run when expected.
+// Native state for one cache entry: the opaque Pardiso handle, its parameter
+// array, the matrix type and dimension it was built for, and a count of the
+// analysis (phase 11) runs the test suite checks.
 struct PardisoState {
   void* handle[64] = {};
   MKL_INT iparm[64] = {};
   MKL_INT matrix_type = 0;
   MKL_INT dimension = 0;
   long analysis_count = 0;
+};
+
+// Why a call rebuilt a factorization instead of using a resident one. Mirrored
+// by RebuildReason in primitive.py, and by the same enum in splineax-klujax.
+// NONE is a cache hit. EVICTED, FREED, and SUPERSEDED name how the key was
+// retired. UNKNOWN means the key was never resident or its tombstone aged out.
+// DTYPE and STALE are reserved so the numbering matches the other library.
+enum class RebuildReason : int32_t {
+  NONE = 0,
+  EVICTED = 1,
+  FREED = 2,
+  SUPERSEDED = 3,
+  DTYPE = 4,
+  UNKNOWN = 5,
+  STALE = 6,
+};
+constexpr int kNumRebuildReasons = 7;
+
+// A 128-bit content hash split into a primary key and a second check lane. The
+// primary key flows through JAX as the handle. The check lane is compared on
+// every lookup so a primary-key collision never hands back the wrong matrix.
+struct ContentKey {
+  uint64_t key = 0;
+  uint64_t check = 0;
 };
 
 // Forces the LP64 interface layer, matching the int32 CSR indices this
@@ -69,24 +98,49 @@ const bool kInterfaceLayerInitialized = [] {
   return true;
 }();
 
-std::mutex& RegistryMutex() {
-  static std::mutex mutex;
-  return mutex;
+// Two-lane FNV-1a-style mixing. Not cryptographic. It only needs to spread
+// content across 128 bits well enough that distinct matrices collide with
+// negligible probability.
+inline void HashFold(uint64_t& a, uint64_t& b, const void* data, size_t bytes) {
+  const unsigned char* p = static_cast<const unsigned char*>(data);
+  for (size_t i = 0; i < bytes; ++i) {
+    a = (a ^ p[i]) * 0x100000001b3ULL;
+    b = (b + p[i]) * 0x9E3779B97F4A7C15ULL;
+    b ^= b >> 29;
+  }
 }
 
-// Must only be accessed while holding RegistryMutex.
-std::unordered_map<int64_t, PardisoState>& Registry() {
-  static std::unordered_map<int64_t, PardisoState> registry;
-  return registry;
-}
-
-// Monotonic source of fresh registry keys, allocated at runtime inside the
-// analyze handler rather than baked in at Python trace time. Never reused,
-// so two concurrent or repeated invocations of a compiled function each get
-// their own registry entry instead of colliding on a trace-time id.
-std::atomic<int64_t>& HandleCounter() {
-  static std::atomic<int64_t> counter{1};
-  return counter;
+// Content key of a CSR matrix and the options it will be built with. domain
+// separates the analyze keyspace ('a') from the factor keyspace ('f'), so the
+// same matrix gets a different key at each stage. The values and the options
+// overlay are both folded in: Pardiso's analysis reads the values when
+// scaling or weighted matching is on, and different options give a different
+// factorization.
+ContentKey HashCsr(char domain, MKL_INT matrix_type, MKL_INT dimension, const int32_t* indptr,
+                   const int32_t* indices, const double* values, const int32_t* overlay_mask,
+                   const int32_t* overlay_values) {
+  int n = static_cast<int>(dimension);
+  int nnz = indptr[n];
+  uint64_t a = 0xcbf29ce484222325ULL;
+  uint64_t b = 0x27d4eb2f165667c5ULL;
+  unsigned char tag = static_cast<unsigned char>(domain);
+  HashFold(a, b, &tag, sizeof(tag));
+  HashFold(a, b, &matrix_type, sizeof(matrix_type));
+  HashFold(a, b, &dimension, sizeof(dimension));
+  HashFold(a, b, &nnz, sizeof(nnz));
+  HashFold(a, b, indptr, sizeof(int32_t) * static_cast<size_t>(n + 1));
+  HashFold(a, b, indices, sizeof(int32_t) * static_cast<size_t>(nnz));
+  HashFold(a, b, values, sizeof(double) * static_cast<size_t>(nnz));
+  HashFold(a, b, overlay_mask, sizeof(int32_t) * 64);
+  HashFold(a, b, overlay_values, sizeof(int32_t) * 64);
+  ContentKey ck;
+  ck.key = a ^ (b << 1);
+  ck.check = b ^ (a >> 1);
+  // Zero is the null-handle sentinel, so a real key is never zero.
+  if (ck.key == 0) {
+    ck.key = 1;
+  }
+  return ck;
 }
 
 // Reinterprets a buffer of our zero-copy int32 CSR arrays as MKL_INT, the
@@ -157,32 +211,72 @@ void ApplyOverlay(MKL_INT* iparm, const int32_t* overlay_mask, const int32_t* ov
   }
 }
 
+// One cache entry: a native Pardiso state and how far it has been taken. An
+// analyzed entry has run phase 11. A factored entry has also run phase 22, so
+// its numeric factorization is valid for a solve. The content key and check
+// lane it is filed under travel with it across a re-key.
+struct CacheEntry {
+  PardisoState state;
+  bool factored = false;
+  uint64_t key = 0;
+  uint64_t check = 0;
+};
+
 // Cache bookkeeping ==================================================================
 //
-// The registry is bounded so that forgetting to release a handle leaks a
-// limited amount of memory rather than growing without end. Handles are kept
-// in an LRU list, and the least recently used one is evicted once the map
-// grows past the cache size. An evicted or released handle is not gone for
-// good: every stateful handler carries the matrix it needs, so a call landing
-// on a missing handle rebuilds its factorization from that matrix (see the
-// rebuild helpers below). This is what makes use of a freed handle safe.
+// The cache is bounded so that forgetting to release a handle leaks a limited
+// amount of memory rather than growing without end. Entries are kept in an LRU
+// list, and the least recently used one is evicted once the map grows past the
+// cache size. A retired key leaves a bounded tombstone recording why it went
+// away, so a later rebuild on it can report EVICTED, FREED, or SUPERSEDED.
 
-// Ordering of handles, most recently used at the front. Guarded by
+std::mutex& RegistryMutex() {
+  static std::mutex mutex;
+  return mutex;
+}
+
+// Must only be accessed while holding RegistryMutex. Keyed by content hash.
+std::map<uint64_t, CacheEntry>& Registry() {
+  static std::map<uint64_t, CacheEntry> registry;
+  return registry;
+}
+
+// Order of live keys, most recently used at the front. Guarded by
 // RegistryMutex, like Registry itself.
-std::list<int64_t>& LruList() {
-  static std::list<int64_t> lru;
+std::list<uint64_t>& LruList() {
+  static std::list<uint64_t> lru;
   return lru;
 }
 
-// Counts how often a missing handle had to rebuild its factorization. A rising
+// Why each retired key went away, bounded like the live cache. Guarded by
+// RegistryMutex.
+std::map<uint64_t, RebuildReason>& Tombstones() {
+  static std::map<uint64_t, RebuildReason> tombstones;
+  return tombstones;
+}
+
+std::list<uint64_t>& TombstoneLru() {
+  static std::list<uint64_t> lru;
+  return lru;
+}
+
+// Counts how often a call had to rebuild a missing factorization. A rising
 // count means the cache is too small for the working set, so this is what the
-// rebuild_count() test/diagnostic hook reports.
+// rebuild_count() diagnostic reports.
 std::atomic<long>& RebuildCounter() {
   static std::atomic<long> counter{0};
   return counter;
 }
 
-// Cache size, from PARDISO_MKL_JAX_FACTOR_CACHE, defaulting to 8 live handles.
+// Per-reason rebuild totals, indexed by RebuildReason. Surfaced by
+// rebuild_stats() so a rising SUPERSEDED points at stale-alias use and a
+// rising EVICTED at cache pressure.
+std::atomic<long>* ReasonCounts() {
+  static std::atomic<long> counts[kNumRebuildReasons];
+  return counts;
+}
+
+// Cache size, from PARDISO_MKL_JAX_FACTOR_CACHE, defaulting to 8 live entries.
 // Read on every access rather than cached so a test can set it per case.
 size_t CacheCapacity() {
   const char* env = std::getenv("PARDISO_MKL_JAX_FACTOR_CACHE");
@@ -204,16 +298,50 @@ bool StrictCache() {
   return env != nullptr && env[0] != '\0' && std::strcmp(env, "0") != 0;
 }
 
-// Move a handle to the front of the LRU list. remove() is O(n) but n is the
-// cache size, a handful of entries, so this stays cheap.
-void TouchLru(int64_t handle) {
-  LruList().remove(handle);
-  LruList().push_front(handle);
+void TouchLru(uint64_t key) {
+  LruList().remove(key);
+  LruList().push_front(key);
+}
+
+// Record why a retired key went away, keeping the tombstone map bounded to the
+// cache capacity. Caller holds RegistryMutex.
+void RecordTombstone(uint64_t key, RebuildReason why) {
+  if (key == 0) {
+    return;
+  }
+  if (Tombstones().find(key) == Tombstones().end()) {
+    TombstoneLru().push_front(key);
+  } else {
+    TombstoneLru().remove(key);
+    TombstoneLru().push_front(key);
+  }
+  Tombstones()[key] = why;
+  size_t capacity = CacheCapacity();
+  while (Tombstones().size() > capacity && !TombstoneLru().empty()) {
+    uint64_t victim = TombstoneLru().back();
+    TombstoneLru().pop_back();
+    Tombstones().erase(victim);
+  }
+}
+
+// Why a key is no longer resident. UNKNOWN when there is no tombstone, which
+// means it was never resident or its tombstone itself aged out. Caller holds
+// RegistryMutex.
+RebuildReason TombstoneReason(uint64_t key) {
+  auto iterator = Tombstones().find(key);
+  return iterator == Tombstones().end() ? RebuildReason::UNKNOWN : iterator->second;
+}
+
+// A live key is no longer a tombstone. Caller holds RegistryMutex.
+void ClearTombstone(uint64_t key) {
+  if (Tombstones().erase(key) != 0) {
+    TombstoneLru().remove(key);
+  }
 }
 
 // Free a state's native factorization (phase -1). Errors are ignored: this
-// runs during eviction, where there is no caller to report to and the memory
-// is being dropped regardless.
+// runs during eviction or a re-key, where there is no caller to report to and
+// the memory is being dropped regardless.
 void FreeState(PardisoState& state) {
   MKL_INT maxfct = 1, mnum = 1, phase = -1, nrhs = 0, message_level = 0, error = 0;
   pardiso(state.handle, &maxfct, &mnum, &state.matrix_type, &phase, &state.dimension,
@@ -221,26 +349,37 @@ void FreeState(PardisoState& state) {
           &message_level, /*b=*/nullptr, /*x=*/nullptr, &error);
 }
 
-// Drop least-recently-used handles until the map is back within the cache
-// size. The handle in use by the current call is at the front, so it is never
-// the victim as long as the capacity is at least one.
+// Drop least-recently-used entries until the map is back within the cache
+// size, freeing each one and leaving an EVICTED tombstone. The entry in use by
+// the current call is at the front, so it is never the victim as long as the
+// capacity is at least one. Caller holds RegistryMutex.
 void EvictIfNeeded() {
   const size_t capacity = CacheCapacity();
   while (Registry().size() > capacity && !LruList().empty()) {
-    int64_t victim = LruList().back();
+    uint64_t victim = LruList().back();
     LruList().pop_back();
     auto iterator = Registry().find(victim);
     if (iterator == Registry().end()) {
       continue;
     }
-    FreeState(iterator->second);
+    FreeState(iterator->second.state);
     Registry().erase(iterator);
+    RecordTombstone(victim, RebuildReason::EVICTED);
+  }
+}
+
+void NoteRebuild(RebuildReason why) {
+  RebuildCounter().fetch_add(1);
+  int index = static_cast<int>(why);
+  if (index >= 0 && index < kNumRebuildReasons) {
+    ReasonCounts()[index].fetch_add(1);
   }
 }
 
 // Run the symbolic analysis (phase 11) into state, from the given matrix. The
-// caller has already set state's matrix type, dimension, and iparm. pt is
-// zeroed first because Pardiso expects a clean handle for a fresh analysis.
+// caller has already set state's matrix type, dimension, and iparm. Any pt the
+// state still holds is freed first, then pt is zeroed, which Pardiso expects
+// for a fresh analysis.
 MKL_INT RunAnalysis(PardisoState& state, const int32_t* indptr, const int32_t* indices,
                     const double* values) {
   std::memset(state.handle, 0, sizeof(state.handle));
@@ -252,8 +391,8 @@ MKL_INT RunAnalysis(PardisoState& state, const int32_t* indptr, const int32_t* i
   return error;
 }
 
-// Run the numeric factorization (phase 22) into state, from the given matrix.
-// Used only to rebuild a missing factorization before a solve.
+// Run the numeric factorization (phase 22) into state, reusing the analysis
+// already in its pt. The caller guarantees the pattern matches that analysis.
 MKL_INT RunNumeric(PardisoState& state, const int32_t* indptr, const int32_t* indices,
                    const double* values) {
   MKL_INT maxfct = 1, mnum = 1, phase = 22, nrhs = 0, message_level = 0, error = 0;
@@ -261,6 +400,16 @@ MKL_INT RunNumeric(PardisoState& state, const int32_t* indptr, const int32_t* in
           const_cast<double*>(values), AsMklInt(indptr), AsMklInt(indices), /*perm=*/nullptr,
           &nrhs, state.iparm, &message_level, /*b=*/nullptr, /*x=*/nullptr, &error);
   return error;
+}
+
+// Set an entry's matrix type, dimension, and iparm for a call. The transpose
+// entry (iparm[11]) is left at its default here and set separately by solve.
+void PrepareIparm(PardisoState& state, MKL_INT matrix_type, MKL_INT dimension,
+                  const int32_t* overlay_mask, const int32_t* overlay_values) {
+  state.matrix_type = matrix_type;
+  state.dimension = dimension;
+  InitializeIparm(state.iparm, state.matrix_type);
+  ApplyOverlay(state.iparm, overlay_mask, overlay_values);
 }
 
 }  // namespace
@@ -278,17 +427,17 @@ extern "C" void pardiso_default_iparm(long matrix_type, int32_t* out) {
   }
 }
 
-extern "C" long pardiso_analysis_count(long handle) {
+extern "C" long pardiso_analysis_count(unsigned long long handle) {
   std::lock_guard<std::mutex> lock(RegistryMutex());
-  auto iterator = Registry().find(handle);
-  return iterator == Registry().end() ? 0 : iterator->second.analysis_count;
+  auto iterator = Registry().find(static_cast<uint64_t>(handle));
+  return iterator == Registry().end() ? 0 : iterator->second.state.analysis_count;
 }
 
-extern "C" void pardiso_reset_analysis_count(long handle) {
+extern "C" void pardiso_reset_analysis_count(unsigned long long handle) {
   std::lock_guard<std::mutex> lock(RegistryMutex());
-  auto iterator = Registry().find(handle);
+  auto iterator = Registry().find(static_cast<uint64_t>(handle));
   if (iterator != Registry().end()) {
-    iterator->second.analysis_count = 0;
+    iterator->second.state.analysis_count = 0;
   }
 }
 
@@ -300,393 +449,416 @@ extern "C" long pardiso_rebuild_count() {
 
 extern "C" void pardiso_reset_rebuild_count() {
   RebuildCounter().store(0);
+  for (int i = 0; i < kNumRebuildReasons; ++i) {
+    ReasonCounts()[i].store(0);
+  }
+}
+
+// Per-reason rebuild total, for rebuild_stats(). An out-of-range reason
+// returns 0.
+extern "C" long pardiso_rebuild_reason_count(int reason) {
+  if (reason < 0 || reason >= kNumRebuildReasons) {
+    return 0;
+  }
+  return ReasonCounts()[reason].load();
 }
 
 namespace {
 
-// Analyze (phase 11). Allocates a fresh registry key, runs the symbolic
-// factorization into a new PardisoState, and returns the key as an int64
-// handle value. Every later stage (factor, solve, release) takes this
-// handle as an ordinary input, which is what lets XLA order the lifecycle by
-// data dependency instead of by a static, trace-time-baked id.
+// Analyze (phase 11). Content-addressed and pure: the returned handle is the
+// hash of the matrix and options, so two identical analyze calls dedup to one
+// entry. On a hit the resident analysis is reused. On a miss a fresh entry is
+// built and filed under its key. Every later stage takes this handle as data,
+// which is what orders the analyze -> factor -> solve chain and lets it run
+// inside a jit trace.
 ffi::Error PardisoAnalyzeImpl(int64_t matrix_type, int64_t dimension,
                                ffi::Buffer<ffi::S32> indptr, ffi::Buffer<ffi::S32> indices,
                                ffi::Buffer<ffi::F64> values, ffi::Buffer<ffi::S32> options_mask,
                                ffi::Buffer<ffi::S32> options_values,
-                               ffi::ResultBuffer<ffi::S64> handle_out,
+                               ffi::ResultBuffer<ffi::U64> handle_out,
                                ffi::ResultBuffer<ffi::S32> status,
                                ffi::ResultBuffer<ffi::S32> final_iparm) {
-  int64_t handle = HandleCounter().fetch_add(1);
+  MKL_INT mtype = static_cast<MKL_INT>(matrix_type);
+  MKL_INT dim = static_cast<MKL_INT>(dimension);
+  ContentKey ck = HashCsr('a', mtype, dim, indptr.typed_data(), indices.typed_data(),
+                          values.typed_data(), options_mask.typed_data(),
+                          options_values.typed_data());
 
   std::lock_guard<std::mutex> lock(RegistryMutex());
-  PardisoState& state = Registry()[handle];
-  state.matrix_type = static_cast<MKL_INT>(matrix_type);
-  state.dimension = static_cast<MKL_INT>(dimension);
-  InitializeIparm(state.iparm, state.matrix_type);
-  ApplyOverlay(state.iparm, options_mask.typed_data(), options_values.typed_data());
+  handle_out->typed_data()[0] = ck.key;
 
-  MKL_INT maxfct = 1;
-  MKL_INT mnum = 1;
-  MKL_INT phase_value = 11;
-  MKL_INT number_of_right_hand_sides = 0;
-  MKL_INT message_level = 0;
-  MKL_INT error = 0;
+  auto iterator = Registry().find(ck.key);
+  if (iterator != Registry().end() && iterator->second.check == ck.check) {
+    // Dedup: an analysis of this exact matrix and options is already resident.
+    TouchLru(ck.key);
+    std::memcpy(final_iparm->typed_data(), iterator->second.state.iparm, sizeof(MKL_INT) * 64);
+    status->typed_data()[0] = 0;
+    return ffi::Error::Success();
+  }
 
-  pardiso(state.handle, &maxfct, &mnum, &state.matrix_type, &phase_value, &state.dimension,
-          const_cast<double*>(values.typed_data()), AsMklInt(indptr.typed_data()),
-          AsMklInt(indices.typed_data()), /*perm=*/nullptr, &number_of_right_hand_sides,
-          state.iparm, &message_level, /*b=*/nullptr, /*x=*/nullptr, &error);
-
-  state.analysis_count += 1;
-  // Newest handle goes to the front, then evict so the cache stays bounded.
-  TouchLru(handle);
-  EvictIfNeeded();
-  handle_out->typed_data()[0] = handle;
-  std::memcpy(final_iparm->typed_data(), state.iparm, sizeof(MKL_INT) * 64);
+  CacheEntry entry;
+  entry.key = ck.key;
+  entry.check = ck.check;
+  PrepareIparm(entry.state, mtype, dim, options_mask.typed_data(), options_values.typed_data());
+  MKL_INT error = RunAnalysis(entry.state, indptr.typed_data(), indices.typed_data(),
+                              values.typed_data());
+  std::memcpy(final_iparm->typed_data(), entry.state.iparm, sizeof(MKL_INT) * 64);
   status->typed_data()[0] = static_cast<int32_t>(error);
   if (error != 0) {
     return ffi::Error::Internal(PardisoErrorMessage("analyze", error));
   }
+  Registry()[ck.key] = std::move(entry);
+  ClearTombstone(ck.key);
+  TouchLru(ck.key);
+  EvictIfNeeded();
   return ffi::Error::Success();
 }
 
-// Re-analyze (phase 11) in place, against the state an earlier analyze
-// already allocated for this handle. Frees the existing factorization first,
-// then runs a fresh symbolic phase into the same registry entry, so the
-// handle value never changes and later calls stay ordered against it by data
-// dependency. That is the point of this handler: re-analyzing through the
-// plain analyze handler would mint a second handle the caller then has to
-// free separately.
-//
-// The free and the re-analysis happen under a single lock hold, so the entry
-// is never observable in the half-freed state between them.
+// Re-analyze (phase 11) for a possibly new matrix or options, retiring the old
+// handle. Content-addressed like analyze, so re-analyzing the same inputs is a
+// dedup, and the numeric factorization is gone afterwards, so factor must run
+// again before any solve. A missing input handle is a rebuild, reported as an
+// error under strict mode.
 ffi::Error PardisoReanalyzeImpl(int64_t matrix_type, int64_t dimension,
-                                 ffi::Buffer<ffi::S64> handle_in, ffi::Buffer<ffi::S32> indptr,
+                                 ffi::Buffer<ffi::U64> handle_in, ffi::Buffer<ffi::S32> indptr,
                                  ffi::Buffer<ffi::S32> indices, ffi::Buffer<ffi::F64> values,
                                  ffi::Buffer<ffi::S32> options_mask,
                                  ffi::Buffer<ffi::S32> options_values,
-                                 ffi::ResultBuffer<ffi::S64> handle_out,
+                                 ffi::ResultBuffer<ffi::U64> handle_out,
                                  ffi::ResultBuffer<ffi::S32> status,
                                  ffi::ResultBuffer<ffi::S32> final_iparm) {
-  int64_t handle = handle_in.typed_data()[0];
-
-  // Every early return below still fills the result buffers. Returning an
-  // error makes JAX raise rather than read them, but XLA allocated them
-  // uninitialized and leaving them that way is a trap for anyone who later
-  // makes a failure path non-fatal.
-  handle_out->typed_data()[0] = handle;
-  std::memset(final_iparm->typed_data(), 0, sizeof(int32_t) * 64);
+  uint64_t old_key = handle_in.typed_data()[0];
+  MKL_INT mtype = static_cast<MKL_INT>(matrix_type);
+  MKL_INT dim = static_cast<MKL_INT>(dimension);
+  ContentKey ck = HashCsr('a', mtype, dim, indptr.typed_data(), indices.typed_data(),
+                          values.typed_data(), options_mask.typed_data(),
+                          options_values.typed_data());
 
   std::lock_guard<std::mutex> lock(RegistryMutex());
-  auto iterator = Registry().find(handle);
-  bool missing = iterator == Registry().end();
-  // A missing handle is no longer an error: it was evicted or released, so we
-  // just analyze fresh in place under the same handle. Strict mode is the
-  // exception, turning that rebuild into a loud error for debugging.
-  if (missing && StrictCache()) {
+  handle_out->typed_data()[0] = ck.key;
+  std::memset(final_iparm->typed_data(), 0, sizeof(int32_t) * 64);
+
+  auto old_iterator = Registry().find(old_key);
+  bool old_missing = old_iterator == Registry().end();
+  if (old_missing && StrictCache()) {
     status->typed_data()[0] = -1;
-    return ffi::Error::Internal("pardiso reanalyze: handle " + std::to_string(handle) +
-                                " was evicted or freed and strict cache mode is on");
-  }
-  if (missing) {
-    RebuildCounter().fetch_add(1);
-  }
-  PardisoState& state = Registry()[handle];
-
-  MKL_INT maxfct = 1;
-  MKL_INT mnum = 1;
-  MKL_INT number_of_right_hand_sides = 0;
-  MKL_INT message_level = 0;
-
-  if (!missing) {
-    // Release the existing factorization first, against the matrix type and
-    // dimension it was allocated for. The call attributes describe the *new*
-    // analysis and only take effect below.
-    MKL_INT release_phase = -1;
-    MKL_INT release_error = 0;
-    pardiso(state.handle, &maxfct, &mnum, &state.matrix_type, &release_phase, &state.dimension,
-            /*a=*/nullptr, /*ia=*/nullptr, /*ja=*/nullptr, /*perm=*/nullptr,
-            &number_of_right_hand_sides, state.iparm, &message_level, /*b=*/nullptr,
-            /*x=*/nullptr, &release_error);
-    if (release_error != 0) {
-      status->typed_data()[0] = static_cast<int32_t>(release_error);
-      return ffi::Error::Internal(PardisoErrorMessage("reanalyze release", release_error));
-    }
+    return ffi::Error::Internal("pardiso reanalyze: handle was evicted or freed and strict "
+                                "cache mode is on");
   }
 
-  // Pardiso expects a zeroed pt going into a fresh phase 11. The release above
-  // (when there was one) frees what pt pointed at but does not clear the array.
-  std::memset(state.handle, 0, sizeof(state.handle));
-  state.matrix_type = static_cast<MKL_INT>(matrix_type);
-  state.dimension = static_cast<MKL_INT>(dimension);
-  InitializeIparm(state.iparm, state.matrix_type);
-  ApplyOverlay(state.iparm, options_mask.typed_data(), options_values.typed_data());
+  // The old handle is retired either way. Free its state and leave a
+  // SUPERSEDED tombstone, unless the new key is the same matrix (a dedup).
+  if (!old_missing && old_key != ck.key) {
+    FreeState(old_iterator->second.state);
+    Registry().erase(old_iterator);
+    LruList().remove(old_key);
+    RecordTombstone(old_key, RebuildReason::SUPERSEDED);
+  }
+  if (old_missing) {
+    NoteRebuild(TombstoneReason(old_key));
+  }
 
-  MKL_INT phase_value = 11;
-  MKL_INT error = 0;
+  auto existing = Registry().find(ck.key);
+  if (existing != Registry().end() && existing->second.check == ck.check) {
+    TouchLru(ck.key);
+    std::memcpy(final_iparm->typed_data(), existing->second.state.iparm, sizeof(MKL_INT) * 64);
+    status->typed_data()[0] = 0;
+    return ffi::Error::Success();
+  }
 
-  pardiso(state.handle, &maxfct, &mnum, &state.matrix_type, &phase_value, &state.dimension,
-          const_cast<double*>(values.typed_data()), AsMklInt(indptr.typed_data()),
-          AsMklInt(indices.typed_data()), /*perm=*/nullptr, &number_of_right_hand_sides,
-          state.iparm, &message_level, /*b=*/nullptr, /*x=*/nullptr, &error);
-
-  state.analysis_count += 1;
-  TouchLru(handle);
-  EvictIfNeeded();
-  handle_out->typed_data()[0] = handle;
-  std::memcpy(final_iparm->typed_data(), state.iparm, sizeof(MKL_INT) * 64);
+  CacheEntry entry;
+  entry.key = ck.key;
+  entry.check = ck.check;
+  PrepareIparm(entry.state, mtype, dim, options_mask.typed_data(), options_values.typed_data());
+  MKL_INT error = RunAnalysis(entry.state, indptr.typed_data(), indices.typed_data(),
+                              values.typed_data());
+  std::memcpy(final_iparm->typed_data(), entry.state.iparm, sizeof(MKL_INT) * 64);
   status->typed_data()[0] = static_cast<int32_t>(error);
   if (error != 0) {
     return ffi::Error::Internal(PardisoErrorMessage("reanalyze", error));
   }
+  Registry()[ck.key] = std::move(entry);
+  ClearTombstone(ck.key);
+  TouchLru(ck.key);
+  EvictIfNeeded();
   return ffi::Error::Success();
 }
 
-// Numeric factorization (phase 22) against the state already allocated by
-// analyze for this handle. Returns the same handle unchanged, so a later
-// solve that takes this handler's output as input is ordered after the
-// factorization.
+// Numeric factorization (phase 22). Returns a factor-domain handle naming the
+// factorization of these values, distinct from the analyze handle it takes.
+// When the input analysis is resident, its pt is reused (the analysis is not
+// redone) and re-keyed to the factor key, so a stale alias of the analysis
+// handle rebuilds. When it is gone, the whole analyze then factor chain is
+// rebuilt from the carried matrix.
 ffi::Error PardisoFactorImpl(int64_t matrix_type, int64_t dimension,
-                              ffi::Buffer<ffi::S64> handle_in, ffi::Buffer<ffi::S32> indptr,
+                              ffi::Buffer<ffi::U64> handle_in, ffi::Buffer<ffi::S32> indptr,
                               ffi::Buffer<ffi::S32> indices, ffi::Buffer<ffi::F64> values,
                               ffi::Buffer<ffi::S32> options_mask,
                               ffi::Buffer<ffi::S32> options_values,
-                              ffi::ResultBuffer<ffi::S64> handle_out,
+                              ffi::ResultBuffer<ffi::U64> handle_out,
                               ffi::ResultBuffer<ffi::S32> status,
                               ffi::ResultBuffer<ffi::S32> final_iparm) {
-  int64_t handle = handle_in.typed_data()[0];
+  uint64_t in_key = handle_in.typed_data()[0];
+  MKL_INT mtype = static_cast<MKL_INT>(matrix_type);
+  MKL_INT dim = static_cast<MKL_INT>(dimension);
+  ContentKey ck = HashCsr('f', mtype, dim, indptr.typed_data(), indices.typed_data(),
+                          values.typed_data(), options_mask.typed_data(),
+                          options_values.typed_data());
 
   std::lock_guard<std::mutex> lock(RegistryMutex());
-  bool missing = Registry().find(handle) == Registry().end();
-  handle_out->typed_data()[0] = handle;
-  // A missing handle lost its analysis to eviction or release. We rebuild it
-  // below from the matrix this call carries. Strict mode reports it instead.
-  if (missing && StrictCache()) {
-    std::memset(final_iparm->typed_data(), 0, sizeof(int32_t) * 64);
-    status->typed_data()[0] = -1;
-    return ffi::Error::Internal("pardiso factor: handle " + std::to_string(handle) +
-                                " was evicted or freed and strict cache mode is on");
+  handle_out->typed_data()[0] = ck.key;
+
+  auto factored = Registry().find(ck.key);
+  if (factored != Registry().end() && factored->second.check == ck.check &&
+      factored->second.factored) {
+    // Dedup: this exact factorization is already resident.
+    TouchLru(ck.key);
+    std::memcpy(final_iparm->typed_data(), factored->second.state.iparm, sizeof(MKL_INT) * 64);
+    status->typed_data()[0] = 0;
+    return ffi::Error::Success();
   }
 
-  PardisoState& state = Registry()[handle];
-  state.matrix_type = static_cast<MKL_INT>(matrix_type);
-  state.dimension = static_cast<MKL_INT>(dimension);
-  InitializeIparm(state.iparm, state.matrix_type);
-  ApplyOverlay(state.iparm, options_mask.typed_data(), options_values.typed_data());
-
-  if (missing) {
-    RebuildCounter().fetch_add(1);
-    MKL_INT analyze_error =
-        RunAnalysis(state, indptr.typed_data(), indices.typed_data(), values.typed_data());
+  CacheEntry entry;
+  auto source = Registry().find(in_key);
+  bool reuse_analysis = source != Registry().end();
+  if (reuse_analysis) {
+    // Take the analyzed pt and re-key it. Its options may differ from this
+    // call's, so reset iparm before the numeric phase.
+    entry = std::move(source->second);
+    Registry().erase(source);
+    if (in_key != ck.key) {
+      LruList().remove(in_key);
+      RecordTombstone(in_key, RebuildReason::SUPERSEDED);
+    }
+    PrepareIparm(entry.state, mtype, dim, options_mask.typed_data(), options_values.typed_data());
+  } else {
+    if (StrictCache()) {
+      std::memset(final_iparm->typed_data(), 0, sizeof(int32_t) * 64);
+      status->typed_data()[0] = -1;
+      return ffi::Error::Internal("pardiso factor: analysis handle was evicted or freed and "
+                                  "strict cache mode is on");
+    }
+    NoteRebuild(TombstoneReason(in_key));
+    PrepareIparm(entry.state, mtype, dim, options_mask.typed_data(), options_values.typed_data());
+    MKL_INT analyze_error = RunAnalysis(entry.state, indptr.typed_data(), indices.typed_data(),
+                                        values.typed_data());
     if (analyze_error != 0) {
-      std::memcpy(final_iparm->typed_data(), state.iparm, sizeof(MKL_INT) * 64);
+      std::memcpy(final_iparm->typed_data(), entry.state.iparm, sizeof(MKL_INT) * 64);
       status->typed_data()[0] = static_cast<int32_t>(analyze_error);
       return ffi::Error::Internal(PardisoErrorMessage("factor rebuild analyze", analyze_error));
     }
   }
 
-  MKL_INT maxfct = 1;
-  MKL_INT mnum = 1;
-  MKL_INT phase_value = 22;
-  MKL_INT number_of_right_hand_sides = 0;
-  MKL_INT message_level = 0;
-  MKL_INT error = 0;
-
-  pardiso(state.handle, &maxfct, &mnum, &state.matrix_type, &phase_value, &state.dimension,
-          const_cast<double*>(values.typed_data()), AsMklInt(indptr.typed_data()),
-          AsMklInt(indices.typed_data()), /*perm=*/nullptr, &number_of_right_hand_sides,
-          state.iparm, &message_level, /*b=*/nullptr, /*x=*/nullptr, &error);
-
-  TouchLru(handle);
-  EvictIfNeeded();
-  std::memcpy(final_iparm->typed_data(), state.iparm, sizeof(MKL_INT) * 64);
+  MKL_INT error = RunNumeric(entry.state, indptr.typed_data(), indices.typed_data(),
+                             values.typed_data());
+  entry.factored = true;
+  entry.key = ck.key;
+  entry.check = ck.check;
+  std::memcpy(final_iparm->typed_data(), entry.state.iparm, sizeof(MKL_INT) * 64);
   status->typed_data()[0] = static_cast<int32_t>(error);
   if (error != 0) {
     return ffi::Error::Internal(PardisoErrorMessage("factor", error));
   }
+  Registry()[ck.key] = std::move(entry);
+  ClearTombstone(ck.key);
+  TouchLru(ck.key);
+  EvictIfNeeded();
   return ffi::Error::Success();
 }
 
-// Solve (phase 33) against a factorization already produced for handle.
-// transpose_mode is iparm[11] directly: 0 solves Ax = b, 2 solves A^T x = b
-// (conjugate transpose, value 1, coincides with plain transpose for the
-// real-valued matrices this package supports). Reuses the same
-// factorization either way: an LU (or LDL^T) factorization of A supports
-// solving with A^T through forward/back substitution in the opposite
-// order, with no need to refactorize.
+// Solve (phase 33) against the factorization the handle names. A hit reuses
+// the resident numeric factorization, which is safe because the factor key
+// encodes the exact values it was built from. A miss rebuilds the analysis and
+// numeric factorization from the carried matrix, files them under the handle,
+// and reports why through rebuild_reason. transpose_mode is iparm[11]: 0 solves
+// Ax = b, 2 solves A^T x = b, reusing the same factorization either way.
 ffi::Error PardisoSolveImpl(int64_t matrix_type, int64_t dimension,
                              int64_t number_of_right_hand_sides, int64_t transpose_mode,
-                             ffi::Buffer<ffi::S64> handle_in, ffi::Buffer<ffi::S32> indptr,
+                             ffi::Buffer<ffi::U64> handle_in, ffi::Buffer<ffi::S32> indptr,
                              ffi::Buffer<ffi::S32> indices, ffi::Buffer<ffi::F64> values,
                              ffi::Buffer<ffi::F64> right_hand_side,
                              ffi::Buffer<ffi::S32> options_mask,
                              ffi::Buffer<ffi::S32> options_values,
                              ffi::ResultBuffer<ffi::F64> solution,
-                             ffi::ResultBuffer<ffi::S32> final_iparm) {
-  int64_t handle = handle_in.typed_data()[0];
+                             ffi::ResultBuffer<ffi::S32> final_iparm,
+                             ffi::ResultBuffer<ffi::S32> rebuild_reason) {
+  uint64_t key = handle_in.typed_data()[0];
+  MKL_INT mtype = static_cast<MKL_INT>(matrix_type);
+  MKL_INT dim = static_cast<MKL_INT>(dimension);
 
   std::lock_guard<std::mutex> lock(RegistryMutex());
-  bool missing = Registry().find(handle) == Registry().end();
-  // A missing handle lost both its analysis and its factorization. A solve
-  // needs both, so we rebuild them from this call's matrix before solving.
-  // Strict mode reports the miss instead of quietly redoing the work.
-  if (missing && StrictCache()) {
+  rebuild_reason->typed_data()[0] = static_cast<int32_t>(RebuildReason::NONE);
+
+  auto iterator = Registry().find(key);
+  bool hit = iterator != Registry().end() && iterator->second.factored;
+  if (!hit && StrictCache()) {
     std::memset(solution->typed_data(), 0, solution->element_count() * sizeof(double));
     std::memset(final_iparm->typed_data(), 0, sizeof(int32_t) * 64);
-    return ffi::Error::Internal("pardiso solve: handle " + std::to_string(handle) +
-                                " was evicted or freed and strict cache mode is on");
+    return ffi::Error::Internal("pardiso solve: handle was evicted or freed and strict cache "
+                                "mode is on");
   }
 
-  PardisoState& state = Registry()[handle];
-  state.matrix_type = static_cast<MKL_INT>(matrix_type);
-  state.dimension = static_cast<MKL_INT>(dimension);
-  InitializeIparm(state.iparm, state.matrix_type);
-  ApplyOverlay(state.iparm, options_mask.typed_data(), options_values.typed_data());
-  // Set unconditionally (not only when transposed) so a later solve on the
-  // same handle without transpose is not left with a stale value from an
-  // earlier call. Applied after ApplyOverlay: canonicalize_overlay in
-  // iparm.py guarantees a caller-supplied overlay never touches index 11
-  // (transpose_mode is the sole owner of it), so there is no real conflict
-  // to resolve here.
-  state.iparm[11] = static_cast<MKL_INT>(transpose_mode);
-
-  if (missing) {
-    RebuildCounter().fetch_add(1);
-    MKL_INT rebuild_error =
-        RunAnalysis(state, indptr.typed_data(), indices.typed_data(), values.typed_data());
+  CacheEntry* entry = nullptr;
+  if (hit) {
+    entry = &iterator->second;
+  } else {
+    // Rebuild the analysis and numeric factorization from the carried matrix,
+    // then file the entry under the handle the caller used so a later solve
+    // with the same handle hits.
+    RebuildReason reason = TombstoneReason(key);
+    rebuild_reason->typed_data()[0] = static_cast<int32_t>(reason);
+    NoteRebuild(reason);
+    if (iterator != Registry().end()) {
+      FreeState(iterator->second.state);
+      Registry().erase(iterator);
+      LruList().remove(key);
+    }
+    CacheEntry rebuilt;
+    rebuilt.key = key;
+    PrepareIparm(rebuilt.state, mtype, dim, options_mask.typed_data(),
+                 options_values.typed_data());
+    MKL_INT rebuild_error = RunAnalysis(rebuilt.state, indptr.typed_data(),
+                                        indices.typed_data(), values.typed_data());
     if (rebuild_error == 0) {
-      rebuild_error =
-          RunNumeric(state, indptr.typed_data(), indices.typed_data(), values.typed_data());
+      rebuild_error = RunNumeric(rebuilt.state, indptr.typed_data(), indices.typed_data(),
+                                 values.typed_data());
     }
     if (rebuild_error != 0) {
-      std::memcpy(final_iparm->typed_data(), state.iparm, sizeof(MKL_INT) * 64);
+      std::memcpy(final_iparm->typed_data(), rebuilt.state.iparm, sizeof(MKL_INT) * 64);
       return ffi::Error::Internal(PardisoErrorMessage("solve rebuild", rebuild_error));
     }
+    rebuilt.factored = true;
+    Registry()[key] = std::move(rebuilt);
+    ClearTombstone(key);
+    entry = &Registry()[key];
   }
 
-  MKL_INT maxfct = 1;
-  MKL_INT mnum = 1;
-  MKL_INT phase_value = 33;
-  MKL_INT nrhs = static_cast<MKL_INT>(number_of_right_hand_sides);
-  MKL_INT message_level = 0;
-  MKL_INT error = 0;
+  // Set the transpose entry unconditionally so a later solve on the same entry
+  // without transpose is not left with a stale value. canonicalize_overlay in
+  // iparm.py keeps a caller-supplied overlay off index 11, so nothing conflicts.
+  entry->state.iparm[11] = static_cast<MKL_INT>(transpose_mode);
 
-  pardiso(state.handle, &maxfct, &mnum, &state.matrix_type, &phase_value, &state.dimension,
-          const_cast<double*>(values.typed_data()), AsMklInt(indptr.typed_data()),
-          AsMklInt(indices.typed_data()), /*perm=*/nullptr, &nrhs, state.iparm, &message_level,
+  MKL_INT maxfct = 1, mnum = 1, phase_value = 33;
+  MKL_INT nrhs = static_cast<MKL_INT>(number_of_right_hand_sides);
+  MKL_INT message_level = 0, error = 0;
+  pardiso(entry->state.handle, &maxfct, &mnum, &entry->state.matrix_type, &phase_value,
+          &entry->state.dimension, const_cast<double*>(values.typed_data()),
+          AsMklInt(indptr.typed_data()), AsMklInt(indices.typed_data()), /*perm=*/nullptr, &nrhs,
+          entry->state.iparm, &message_level,
           const_cast<double*>(right_hand_side.typed_data()), solution->typed_data(), &error);
 
-  TouchLru(handle);
+  TouchLru(key);
   EvictIfNeeded();
-  std::memcpy(final_iparm->typed_data(), state.iparm, sizeof(MKL_INT) * 64);
+  std::memcpy(final_iparm->typed_data(), entry->state.iparm, sizeof(MKL_INT) * 64);
   if (error != 0) {
     return ffi::Error::Internal(PardisoErrorMessage("solve", error));
   }
   return ffi::Error::Success();
 }
 
-// Numeric factorization and solve in a single call (combined phase 23),
-// reusing the symbolic analysis already produced for handle. Doing both in
-// one FFI call keeps stateful reuse safe even when the handle otherwise
-// carries the ordering, since it also collapses two native calls that touch
-// the same registry entry into one. The analysis (phase 11) is not
-// repeated, so analysis_count is left untouched.
+// Numeric factorization and solve in one call (combined phase 23), reusing the
+// analysis the handle names. Unlike factor, this does not re-key: it recomputes
+// the numeric factorization in place and never returns a token, so the analysis
+// handle stays usable across many calls (the fast path for a jitted loop). A
+// miss rebuilds the analysis from the carried matrix and reports why.
 ffi::Error PardisoFactorSolveImpl(int64_t matrix_type, int64_t dimension,
                                    int64_t number_of_right_hand_sides, int64_t transpose_mode,
-                                   ffi::Buffer<ffi::S64> handle_in, ffi::Buffer<ffi::S32> indptr,
+                                   ffi::Buffer<ffi::U64> handle_in, ffi::Buffer<ffi::S32> indptr,
                                    ffi::Buffer<ffi::S32> indices, ffi::Buffer<ffi::F64> values,
                                    ffi::Buffer<ffi::F64> right_hand_side,
                                    ffi::Buffer<ffi::S32> options_mask,
                                    ffi::Buffer<ffi::S32> options_values,
                                    ffi::ResultBuffer<ffi::F64> solution,
-                                   ffi::ResultBuffer<ffi::S32> final_iparm) {
-  int64_t handle = handle_in.typed_data()[0];
+                                   ffi::ResultBuffer<ffi::S32> final_iparm,
+                                   ffi::ResultBuffer<ffi::S32> rebuild_reason) {
+  uint64_t key = handle_in.typed_data()[0];
+  MKL_INT mtype = static_cast<MKL_INT>(matrix_type);
+  MKL_INT dim = static_cast<MKL_INT>(dimension);
 
   std::lock_guard<std::mutex> lock(RegistryMutex());
-  bool missing = Registry().find(handle) == Registry().end();
-  // A missing handle lost its analysis. Phase 23 refactors and solves but
-  // still needs an analysis to reuse, so we rebuild that from this call's
-  // matrix. Strict mode reports the miss instead.
-  if (missing && StrictCache()) {
+  rebuild_reason->typed_data()[0] = static_cast<int32_t>(RebuildReason::NONE);
+
+  auto iterator = Registry().find(key);
+  bool has_analysis = iterator != Registry().end();
+  if (!has_analysis && StrictCache()) {
     std::memset(solution->typed_data(), 0, solution->element_count() * sizeof(double));
     std::memset(final_iparm->typed_data(), 0, sizeof(int32_t) * 64);
-    return ffi::Error::Internal("pardiso factor_and_solve: handle " + std::to_string(handle) +
-                                " was evicted or freed and strict cache mode is on");
+    return ffi::Error::Internal("pardiso factor_and_solve: handle was evicted or freed and "
+                                "strict cache mode is on");
   }
 
-  PardisoState& state = Registry()[handle];
-  state.matrix_type = static_cast<MKL_INT>(matrix_type);
-  state.dimension = static_cast<MKL_INT>(dimension);
-  InitializeIparm(state.iparm, state.matrix_type);
-  ApplyOverlay(state.iparm, options_mask.typed_data(), options_values.typed_data());
-  // Set unconditionally, matching PardisoSolveImpl, so a later call without
-  // transpose is not left with a stale value from an earlier one. Applied
-  // after ApplyOverlay for the same reason given there.
-  state.iparm[11] = static_cast<MKL_INT>(transpose_mode);
-
-  if (missing) {
-    RebuildCounter().fetch_add(1);
-    MKL_INT analyze_error =
-        RunAnalysis(state, indptr.typed_data(), indices.typed_data(), values.typed_data());
+  CacheEntry* entry = nullptr;
+  if (has_analysis) {
+    entry = &iterator->second;
+    PrepareIparm(entry->state, mtype, dim, options_mask.typed_data(),
+                 options_values.typed_data());
+  } else {
+    RebuildReason reason = TombstoneReason(key);
+    rebuild_reason->typed_data()[0] = static_cast<int32_t>(reason);
+    NoteRebuild(reason);
+    CacheEntry rebuilt;
+    rebuilt.key = key;
+    PrepareIparm(rebuilt.state, mtype, dim, options_mask.typed_data(),
+                 options_values.typed_data());
+    MKL_INT analyze_error = RunAnalysis(rebuilt.state, indptr.typed_data(),
+                                        indices.typed_data(), values.typed_data());
     if (analyze_error != 0) {
-      std::memcpy(final_iparm->typed_data(), state.iparm, sizeof(MKL_INT) * 64);
+      std::memcpy(final_iparm->typed_data(), rebuilt.state.iparm, sizeof(MKL_INT) * 64);
       return ffi::Error::Internal(
           PardisoErrorMessage("factor_and_solve rebuild analyze", analyze_error));
     }
+    Registry()[key] = std::move(rebuilt);
+    ClearTombstone(key);
+    entry = &Registry()[key];
   }
 
-  MKL_INT maxfct = 1;
-  MKL_INT mnum = 1;
-  MKL_INT phase_value = 23;
+  entry->state.iparm[11] = static_cast<MKL_INT>(transpose_mode);
+
+  MKL_INT maxfct = 1, mnum = 1, phase_value = 23;
   MKL_INT nrhs = static_cast<MKL_INT>(number_of_right_hand_sides);
-  MKL_INT message_level = 0;
-  MKL_INT error = 0;
-
-  pardiso(state.handle, &maxfct, &mnum, &state.matrix_type, &phase_value, &state.dimension,
-          const_cast<double*>(values.typed_data()), AsMklInt(indptr.typed_data()),
-          AsMklInt(indices.typed_data()), /*perm=*/nullptr, &nrhs, state.iparm, &message_level,
+  MKL_INT message_level = 0, error = 0;
+  pardiso(entry->state.handle, &maxfct, &mnum, &entry->state.matrix_type, &phase_value,
+          &entry->state.dimension, const_cast<double*>(values.typed_data()),
+          AsMklInt(indptr.typed_data()), AsMklInt(indices.typed_data()), /*perm=*/nullptr, &nrhs,
+          entry->state.iparm, &message_level,
           const_cast<double*>(right_hand_side.typed_data()), solution->typed_data(), &error);
+  entry->factored = true;
 
-  TouchLru(handle);
+  TouchLru(key);
   EvictIfNeeded();
-  std::memcpy(final_iparm->typed_data(), state.iparm, sizeof(MKL_INT) * 64);
+  std::memcpy(final_iparm->typed_data(), entry->state.iparm, sizeof(MKL_INT) * 64);
   if (error != 0) {
     return ffi::Error::Internal(PardisoErrorMessage("factor_and_solve", error));
   }
   return ffi::Error::Success();
 }
 
-// Frees the native memory for handle (phase -1) and drops it from the
-// registry. A handle that is not present is treated as already released.
-// ordering is an unused operand whose only job is to give XLA a data
-// dependency, so a release inside a jit trace runs after the solves it must
-// follow. See primitive.release.
-ffi::Error PardisoReleaseImpl(ffi::Buffer<ffi::S64> handle_in, ffi::Buffer<ffi::S32> ordering,
+// Frees the native memory for a handle (phase -1) and drops it from the cache,
+// leaving a FREED tombstone so a later use reports why it rebuilt. A handle
+// that is not present is treated as already released. ordering is an unused
+// operand whose only job is to give XLA a data dependency, so a release inside
+// a jit trace runs after the solves it must follow. See primitive.release.
+ffi::Error PardisoReleaseImpl(ffi::Buffer<ffi::U64> handle_in, ffi::Buffer<ffi::S32> ordering,
                               ffi::ResultBuffer<ffi::S32> status) {
   (void)ordering;
-  int64_t handle = handle_in.typed_data()[0];
+  uint64_t key = handle_in.typed_data()[0];
 
   std::lock_guard<std::mutex> lock(RegistryMutex());
-  auto iterator = Registry().find(handle);
+  auto iterator = Registry().find(key);
   if (iterator == Registry().end()) {
     status->typed_data()[0] = 0;
     return ffi::Error::Success();
   }
-  PardisoState& state = iterator->second;
 
-  MKL_INT maxfct = 1;
-  MKL_INT mnum = 1;
-  MKL_INT phase_value = -1;
-  MKL_INT nrhs = 0;
-  MKL_INT message_level = 0;
-  MKL_INT error = 0;
-
+  MKL_INT maxfct = 1, mnum = 1, phase_value = -1, nrhs = 0, message_level = 0, error = 0;
+  PardisoState& state = iterator->second.state;
   pardiso(state.handle, &maxfct, &mnum, &state.matrix_type, &phase_value, &state.dimension,
           /*a=*/nullptr, /*ia=*/nullptr, /*ja=*/nullptr, /*perm=*/nullptr, &nrhs, state.iparm,
           &message_level, /*b=*/nullptr, /*x=*/nullptr, &error);
 
   Registry().erase(iterator);
-  LruList().remove(handle);
+  LruList().remove(key);
+  RecordTombstone(key, RebuildReason::FREED);
   status->typed_data()[0] = static_cast<int32_t>(error);
   if (error != 0) {
     return ffi::Error::Internal(PardisoErrorMessage("release", error));
@@ -697,7 +869,7 @@ ffi::Error PardisoReleaseImpl(ffi::Buffer<ffi::S64> handle_in, ffi::Buffer<ffi::
 // Stateless one-shot solve: analyze, factor, and solve in a single call
 // (combined phase 13) against a local handle, released again before
 // returning. Used by the functional solve() entry point, which never reuses
-// a factorization and so never needs a registry entry.
+// a factorization and so never touches the cache.
 ffi::Error PardisoSolveOnceImpl(int64_t matrix_type, int64_t dimension,
                                  int64_t number_of_right_hand_sides, int64_t transpose_mode,
                                  ffi::Buffer<ffi::S32> indptr, ffi::Buffer<ffi::S32> indices,
@@ -714,28 +886,24 @@ ffi::Error PardisoSolveOnceImpl(int64_t matrix_type, int64_t dimension,
   ApplyOverlay(iparm, options_mask.typed_data(), options_values.typed_data());
   iparm[11] = static_cast<MKL_INT>(transpose_mode);
 
-  MKL_INT maxfct = 1;
-  MKL_INT mnum = 1;
+  MKL_INT maxfct = 1, mnum = 1;
   MKL_INT n = static_cast<MKL_INT>(dimension);
   MKL_INT nrhs = static_cast<MKL_INT>(number_of_right_hand_sides);
-  MKL_INT message_level = 0;
-  MKL_INT solve_phase = 13;
-  MKL_INT error = 0;
+  MKL_INT message_level = 0, solve_phase = 13, error = 0;
 
   pardiso(handle, &maxfct, &mnum, &mtype_value, &solve_phase, &n,
           const_cast<double*>(values.typed_data()), AsMklInt(indptr.typed_data()),
           AsMklInt(indices.typed_data()), /*perm=*/nullptr, &nrhs, iparm, &message_level,
           const_cast<double*>(right_hand_side.typed_data()), solution->typed_data(), &error);
 
-  // Captured right after the solving call and before the release call
-  // below, which reuses the same iparm array and could otherwise overwrite
-  // these diagnostics with whatever the release phase leaves behind.
+  // Captured right after the solving call and before the release call below,
+  // which reuses the same iparm array and could otherwise overwrite these
+  // diagnostics with whatever the release phase leaves behind.
   std::memcpy(final_iparm->typed_data(), iparm, sizeof(MKL_INT) * 64);
 
-  // Always release the local handle, even on failure, so a failed solve
-  // never leaks native memory.
-  MKL_INT release_phase = -1;
-  MKL_INT release_error = 0;
+  // Always release the local handle, even on failure, so a failed solve never
+  // leaks native memory.
+  MKL_INT release_phase = -1, release_error = 0;
   pardiso(handle, &maxfct, &mnum, &mtype_value, &release_phase, &n, nullptr, nullptr, nullptr,
           nullptr, &nrhs, iparm, &message_level, nullptr, nullptr, &release_error);
 
@@ -754,7 +922,7 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(kPardisoAnalyzeHandler, PardisoAnalyzeImpl,
                                    .Arg<ffi::Buffer<ffi::F64>>()  // values
                                    .Arg<ffi::Buffer<ffi::S32>>()  // options_mask
                                    .Arg<ffi::Buffer<ffi::S32>>()  // options_values
-                                   .Ret<ffi::Buffer<ffi::S64>>()  // handle
+                                   .Ret<ffi::Buffer<ffi::U64>>()  // handle
                                    .Ret<ffi::Buffer<ffi::S32>>()  // status
                                    .Ret<ffi::Buffer<ffi::S32>>()  // final_iparm
 );
@@ -763,13 +931,13 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(kPardisoReanalyzeHandler, PardisoReanalyzeImpl,
                                ffi::Ffi::Bind()
                                    .Attr<int64_t>("matrix_type")
                                    .Attr<int64_t>("dimension")
-                                   .Arg<ffi::Buffer<ffi::S64>>()  // handle
+                                   .Arg<ffi::Buffer<ffi::U64>>()  // handle
                                    .Arg<ffi::Buffer<ffi::S32>>()  // indptr
                                    .Arg<ffi::Buffer<ffi::S32>>()  // indices
                                    .Arg<ffi::Buffer<ffi::F64>>()  // values
                                    .Arg<ffi::Buffer<ffi::S32>>()  // options_mask
                                    .Arg<ffi::Buffer<ffi::S32>>()  // options_values
-                                   .Ret<ffi::Buffer<ffi::S64>>()  // handle
+                                   .Ret<ffi::Buffer<ffi::U64>>()  // handle
                                    .Ret<ffi::Buffer<ffi::S32>>()  // status
                                    .Ret<ffi::Buffer<ffi::S32>>()  // final_iparm
 );
@@ -778,13 +946,13 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(kPardisoFactorHandler, PardisoFactorImpl,
                                ffi::Ffi::Bind()
                                    .Attr<int64_t>("matrix_type")
                                    .Attr<int64_t>("dimension")
-                                   .Arg<ffi::Buffer<ffi::S64>>()  // handle
+                                   .Arg<ffi::Buffer<ffi::U64>>()  // handle
                                    .Arg<ffi::Buffer<ffi::S32>>()  // indptr
                                    .Arg<ffi::Buffer<ffi::S32>>()  // indices
                                    .Arg<ffi::Buffer<ffi::F64>>()  // values
                                    .Arg<ffi::Buffer<ffi::S32>>()  // options_mask
                                    .Arg<ffi::Buffer<ffi::S32>>()  // options_values
-                                   .Ret<ffi::Buffer<ffi::S64>>()  // handle
+                                   .Ret<ffi::Buffer<ffi::U64>>()  // handle
                                    .Ret<ffi::Buffer<ffi::S32>>()  // status
                                    .Ret<ffi::Buffer<ffi::S32>>()  // final_iparm
 );
@@ -795,7 +963,7 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(kPardisoSolveHandler, PardisoSolveImpl,
                                    .Attr<int64_t>("dimension")
                                    .Attr<int64_t>("number_of_right_hand_sides")
                                    .Attr<int64_t>("transpose_mode")
-                                   .Arg<ffi::Buffer<ffi::S64>>()  // handle
+                                   .Arg<ffi::Buffer<ffi::U64>>()  // handle
                                    .Arg<ffi::Buffer<ffi::S32>>()  // indptr
                                    .Arg<ffi::Buffer<ffi::S32>>()  // indices
                                    .Arg<ffi::Buffer<ffi::F64>>()  // values
@@ -804,6 +972,7 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(kPardisoSolveHandler, PardisoSolveImpl,
                                    .Arg<ffi::Buffer<ffi::S32>>()  // options_values
                                    .Ret<ffi::Buffer<ffi::F64>>()  // solution
                                    .Ret<ffi::Buffer<ffi::S32>>()  // final_iparm
+                                   .Ret<ffi::Buffer<ffi::S32>>()  // rebuild_reason
 );
 
 XLA_FFI_DEFINE_HANDLER_SYMBOL(kPardisoFactorSolveHandler, PardisoFactorSolveImpl,
@@ -812,7 +981,7 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(kPardisoFactorSolveHandler, PardisoFactorSolveImpl
                                    .Attr<int64_t>("dimension")
                                    .Attr<int64_t>("number_of_right_hand_sides")
                                    .Attr<int64_t>("transpose_mode")
-                                   .Arg<ffi::Buffer<ffi::S64>>()  // handle
+                                   .Arg<ffi::Buffer<ffi::U64>>()  // handle
                                    .Arg<ffi::Buffer<ffi::S32>>()  // indptr
                                    .Arg<ffi::Buffer<ffi::S32>>()  // indices
                                    .Arg<ffi::Buffer<ffi::F64>>()  // values
@@ -821,11 +990,12 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(kPardisoFactorSolveHandler, PardisoFactorSolveImpl
                                    .Arg<ffi::Buffer<ffi::S32>>()  // options_values
                                    .Ret<ffi::Buffer<ffi::F64>>()  // solution
                                    .Ret<ffi::Buffer<ffi::S32>>()  // final_iparm
+                                   .Ret<ffi::Buffer<ffi::S32>>()  // rebuild_reason
 );
 
 XLA_FFI_DEFINE_HANDLER_SYMBOL(kPardisoReleaseHandler, PardisoReleaseImpl,
                                ffi::Ffi::Bind()
-                                   .Arg<ffi::Buffer<ffi::S64>>()  // handle
+                                   .Arg<ffi::Buffer<ffi::U64>>()  // handle
                                    .Arg<ffi::Buffer<ffi::S32>>()  // ordering (unused)
                                    .Ret<ffi::Buffer<ffi::S32>>()  // status
 );

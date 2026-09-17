@@ -146,7 +146,7 @@ def test_vmap_solve_stateful_over_right_hand_side(any_system):
     token = _analyze_factor(indptr, indices, values)
 
     def solve_one(b):
-        sol, _ = primitive.solve_stateful(
+        sol, _, _ = primitive.solve_stateful(
             token, indptr, indices, values, b[None, :], matrix_type=MATRIX_TYPE
         )
         return sol[0]
@@ -166,7 +166,7 @@ def test_vmap_factor_and_solve_stateful_over_right_hand_side(any_system):
     token, _ = primitive.analyze(indptr, indices, values, matrix_type=MATRIX_TYPE)
 
     def solve_one(b):
-        sol, _ = primitive.factor_and_solve_stateful(
+        sol, _, _ = primitive.factor_and_solve_stateful(
             token, indptr, indices, values, b[None, :], matrix_type=MATRIX_TYPE
         )
         return sol[0]
@@ -188,7 +188,7 @@ def test_vmap_factor_and_solve_stateful_over_values(any_system):
     token, _ = primitive.analyze(indptr, indices, values, matrix_type=MATRIX_TYPE)
 
     def solve_one(v):
-        sol, _ = primitive.factor_and_solve_stateful(
+        sol, _, _ = primitive.factor_and_solve_stateful(
             token, indptr, indices, v, right_hand_side[None, :], matrix_type=MATRIX_TYPE
         )
         return sol[0]
@@ -207,10 +207,11 @@ def test_vmap_solve_stateful_rejects_batched_values(any_system):
     values_batch = jnp.stack([values, values * 2.0])
 
     token = _analyze_factor(indptr, indices, values)
+    stacked_rhs = jnp.asarray(right_hand_side)[None, :]
 
     def solve_one(v):
-        sol, _ = primitive.solve_stateful(
-            token, indptr, indices, v, jnp.asarray(right_hand_side)[None, :], matrix_type=MATRIX_TYPE
+        sol, _, _ = primitive.solve_stateful(
+            token, indptr, indices, v, stacked_rhs, matrix_type=MATRIX_TYPE
         )
         return sol[0]
 
@@ -228,7 +229,7 @@ def test_vmap_stateful_rejects_batched_pattern(any_system):
     token = _analyze_factor(indptr, indices, values)
 
     def solve_one(idx, v):
-        sol, _ = primitive.solve_stateful(
+        sol, _, _ = primitive.solve_stateful(
             token, indptr, idx, v, jnp.asarray(right_hand_side)[None, :], matrix_type=MATRIX_TYPE
         )
         return sol[0]
