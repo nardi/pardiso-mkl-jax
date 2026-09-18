@@ -13,6 +13,14 @@ carries a custom vmap rule so that batching over right-hand sides, matrix
 values, or both stays close to what native Pardiso calls can do, instead of
 falling back to a naive per-example Python loop.
 
+`analyze` and `factor` can each hand back an existing native slot instead of
+doing the work again, when one already matches what was asked for closely
+enough (pattern and options for analyze, the exact matrix and options for
+factor): see their docstrings and dedup_hit_count. The id a caller ends up
+holding can change as a result, which every call in this module already
+accounts for by always threading forward the token a function just returned,
+never a token captured earlier.
+
 Every call takes an iparm overlay (see pardiso_mkl_jax.iparm) applied on top
 of the package defaults, and returns the final iparm array alongside its
 usual result, for decoding into a PardisoDiagnostics.
@@ -99,6 +107,26 @@ def reset_rebuild_count() -> None:
     _ffi.reset_rebuild_count()
 
 
+def dedup_hit_count() -> int:
+    """Number of analyze() or factor() calls that reused an existing slot instead
+    of redoing the work, since load or the last reset.
+
+    analyze() reuses a slot whose symbolic analysis already matches the
+    pattern (matrix type, dimension, indptr, indices) and options overlay it
+    was given, skipping phase 11. factor() reuses a slot whose numeric
+    factorization already matches the exact matrix and options, skipping
+    phase 22 (and, transitively, the analysis it would have needed to rebuild
+    first). Either kind of hit can return a different id than the token the
+    call was made on: see their docstrings.
+    """
+    return int(_ffi.dedup_hit_count())
+
+
+def reset_dedup_hit_count() -> None:
+    """Reset the dedup-hit counter to zero."""
+    _ffi.reset_dedup_hit_count()
+
+
 def _overlay_buffers(options: OptionsLike) -> tuple[jax.Array, jax.Array]:
     """Validate and expand an iparm overlay into the (mask, values) buffers the FFI call needs.
 
@@ -163,7 +191,7 @@ def _ordering_operand(token, dependency):
 
 
 def analyze(indptr, indices, values, *, matrix_type: MatrixType, options: OptionsLike = None):
-    """Run the analyze (phase 11) step and allocate a fresh native factorization.
+    """Run the analyze (phase 11) step, or reuse one already run for this pattern.
 
     Returns (token, final_iparm). The token is a FactorizationToken carrying
     the native factorization's cache id, which every later call (factor,
@@ -174,9 +202,22 @@ def analyze(indptr, indices, values, *, matrix_type: MatrixType, options: Option
     function. final_iparm is the complete iparm array as Pardiso left it, for
     decoding into a PardisoDiagnostics.
 
-    Every call allocates a new factorization. To redo the analysis for a
-    token that already has one, use reanalyze instead, which reuses the
-    id rather than leaving the old one for the caller to release.
+    A call whose pattern (matrix type, dimension, indptr, indices) and options
+    overlay exactly match one already analyzed for a live token returns that
+    token's id instead of running phase 11 again: see dedup_hit_count. Values
+    play no part in this, only the pattern, since phase 11 does not need them.
+    Because of this sharing, a call this returns an existing id for is a pure
+    function of its inputs: unlike every other call in this module, it never
+    mutates a slot another live token might already be reading, so JAX is free
+    to drop, reorder, or deduplicate it like any other computation.
+
+    Sharing a slot this way means release()ing one token can free a
+    factorization another live token still expects: that token's next use
+    just rebuilds it from its own matrix (see rebuild_reason), the same
+    self-healing every stateful call already has for an evicted handle. To
+    redo the analysis for a token that already has one without going through
+    this sharing, use reanalyze instead, which always mutates its own id in
+    place and never returns a different one.
     """
     dimension = indptr.shape[0] - 1
     overlay_mask, overlay_values = _overlay_buffers(options)
@@ -187,7 +228,6 @@ def analyze(indptr, indices, values, *, matrix_type: MatrixType, options: Option
             jax.ShapeDtypeStruct((), jnp.int32),
             jax.ShapeDtypeStruct((64,), jnp.int32),
         ),
-        has_side_effect=True,
     )(
         indptr,
         indices,
@@ -245,11 +285,21 @@ def reanalyze(
 def factor(token, indptr, indices, values, *, matrix_type: MatrixType, options: OptionsLike = None):
     """Run the numeric factorization (phase 22) step against token.
 
-    Returns (token, final_iparm). The id comes back unchanged, so a
+    Returns (token, final_iparm). The id usually comes back unchanged, so a
     later call that consumes this function's returned token is ordered after
     the factorization it performed. The returned token's solve counter is
     reset to zero. final_iparm is the complete iparm array as Pardiso left it,
     for decoding into a PardisoDiagnostics.
+
+    The exception is a dedup hit: if this exact matrix and options are
+    already factored into another live slot, this returns that slot's token
+    instead of refactoring, and token's own slot is left untouched (see
+    dedup_hit_count). This is transparent to a caller that always uses the
+    returned token going forward, which every call in this module already
+    does. A caller still holding the original token for this same matrix is
+    unaffected; one still holding it for a different matrix sees a mismatch
+    on its next solve and rebuilds (see rebuild_reason), exactly as if this
+    call had refactored the original token's slot in place instead.
     """
     dimension = indptr.shape[0] - 1
     overlay_mask, overlay_values = _overlay_buffers(options)

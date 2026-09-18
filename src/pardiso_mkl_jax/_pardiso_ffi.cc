@@ -65,6 +65,19 @@ struct PardisoState {
   // False until the first factorization, so a solve on an analyzed but
   // not-yet-factored slot rebuilds rather than using absent factors.
   bool has_factorization = false;
+  // Fingerprint of the sparsity pattern and options this slot's symbolic
+  // analysis was built from, set on phase 11 (analyze or reanalyze). Mirrored
+  // in PatternIndex so a later analyze() for the same pattern can find and
+  // reuse this slot. See PatternFingerprint.
+  uint64_t pattern_fingerprint = 0;
+  // Fingerprint of the pattern, values, and options this slot's numeric
+  // factorization was built from, set on phase 22 or 23. Mirrored in
+  // ValueIndex so a later factor() or factor_and_solve_stateful() call
+  // presenting the exact same matrix can find and reuse this slot instead of
+  // refactoring. Distinct from `fingerprint` above: that one excludes options
+  // (transpose alternation must not count as a mismatch), this one includes
+  // them (two different option sets must never share factors).
+  uint64_t content_key = 0;
 };
 
 // Forces the LP64 interface layer, matching the int32 CSR indices this
@@ -114,39 +127,107 @@ enum RebuildReason : int32_t {
   kRebuildMatrixMismatch = 2,
 };
 
+// Incrementally mixes 64-bit words into a fingerprint, the standard boost
+// hash_combine step: it distributes well and is cheap. Every fingerprint
+// below starts a fresh hasher from the same seed and combines a different
+// selection of a factorization's identity into it.
+class FingerprintHasher {
+ public:
+  FingerprintHasher() : hash_(1469598103934665603ULL) {}  // FNV offset basis
+
+  void Combine(uint64_t word) { hash_ ^= word + 0x9e3779b97f4a7c15ULL + (hash_ << 6) + (hash_ >> 2); }
+
+  uint64_t value() const { return hash_; }
+
+ private:
+  uint64_t hash_;
+};
+
+// Combines a matrix's type, dimension, and indptr into hasher, and returns its
+// entry count (indptr[dimension] under the zero-based indexing this package
+// always sets, iparm[34] = 1). Shared by every fingerprint below that needs
+// the matrix's shape before going on to hash indices, values, or iparm.
+int64_t CombineShape(FingerprintHasher& hasher, MKL_INT matrix_type, MKL_INT dimension,
+                      const int32_t* indptr) {
+  hasher.Combine(static_cast<uint64_t>(matrix_type));
+  hasher.Combine(static_cast<uint64_t>(dimension));
+  const int64_t entry_count = dimension >= 0 ? static_cast<int64_t>(indptr[dimension]) : 0;
+  hasher.Combine(static_cast<uint64_t>(entry_count));
+  for (int64_t i = 0; i <= dimension; ++i) {
+    hasher.Combine(static_cast<uint64_t>(static_cast<uint32_t>(indptr[i])));
+  }
+  return entry_count;
+}
+
+void CombineIparm(FingerprintHasher& hasher, const MKL_INT* iparm) {
+  for (int i = 0; i < 64; ++i) {
+    hasher.Combine(static_cast<uint64_t>(static_cast<uint32_t>(iparm[i])));
+  }
+}
+
 // A 64-bit fingerprint of the matrix a factorization stands for: its type,
 // dimension, sparsity pattern, and exact value bits. A stateful solve compares
 // it against the one recorded when its slot was factored, to tell whether the
 // slot still holds the factors its own matrix would produce or was refactored
-// out from under it (an aliased or stale handle) and must be rebuilt. It is a
-// hash, not a stored copy, which would defeat the zero-copy interface and the
-// cache's bounded memory. A 64-bit collision has probability about 2^-64 per
-// compared pair, below the rate of unrelated hardware error.
+// out from under it (an aliased or stale handle) and must be rebuilt. Options
+// are deliberately excluded, since alternating transpose_mode on one handle
+// must not read as a different matrix. It is a hash, not a stored copy, which
+// would defeat the zero-copy interface and the cache's bounded memory. A
+// 64-bit collision has probability about 2^-64 per compared pair, below the
+// rate of unrelated hardware error.
 uint64_t MatrixFingerprint(MKL_INT matrix_type, MKL_INT dimension, const int32_t* indptr,
                            const int32_t* indices, const double* values) {
-  // FNV offset basis, a fixed nonzero seed.
-  uint64_t hash = 1469598103934665603ULL;
-  auto combine = [&hash](uint64_t word) {
-    hash ^= word + 0x9e3779b97f4a7c15ULL + (hash << 6) + (hash >> 2);
-  };
-  combine(static_cast<uint64_t>(matrix_type));
-  combine(static_cast<uint64_t>(dimension));
-  // Zero-based indexing (iparm[34] = 1) means indptr[dimension] is the number
-  // of stored entries, so this covers the whole of indices and values.
-  const int64_t entry_count = dimension >= 0 ? static_cast<int64_t>(indptr[dimension]) : 0;
-  combine(static_cast<uint64_t>(entry_count));
-  for (int64_t i = 0; i <= dimension; ++i) {
-    combine(static_cast<uint64_t>(static_cast<uint32_t>(indptr[i])));
-  }
+  FingerprintHasher hasher;
+  const int64_t entry_count = CombineShape(hasher, matrix_type, dimension, indptr);
   // One index and one value per entry, hashed together so a single pass keeps
   // both in cache.
   for (int64_t i = 0; i < entry_count; ++i) {
-    combine(static_cast<uint64_t>(static_cast<uint32_t>(indices[i])));
+    hasher.Combine(static_cast<uint64_t>(static_cast<uint32_t>(indices[i])));
     uint64_t bits;
     std::memcpy(&bits, &values[i], sizeof(bits));
-    combine(bits);
+    hasher.Combine(bits);
   }
-  return hash;
+  return hasher.value();
+}
+
+// A 64-bit fingerprint of a sparsity pattern and the options its symbolic
+// analysis was run with: type, dimension, pattern, and the full effective
+// iparm (post-overlay), no values. Two analyze() calls with an equal
+// fingerprint produce the same phase 11 result, so PatternIndex lets a later
+// one reuse the first one's slot instead of re-running it. The whole iparm is
+// included, not a chosen subset, so no option that might affect the analysis
+// is ever missed.
+uint64_t PatternFingerprint(MKL_INT matrix_type, MKL_INT dimension, const int32_t* indptr,
+                            const int32_t* indices, const MKL_INT* iparm) {
+  FingerprintHasher hasher;
+  const int64_t entry_count = CombineShape(hasher, matrix_type, dimension, indptr);
+  for (int64_t i = 0; i < entry_count; ++i) {
+    hasher.Combine(static_cast<uint64_t>(static_cast<uint32_t>(indices[i])));
+  }
+  CombineIparm(hasher, iparm);
+  return hasher.value();
+}
+
+// A 64-bit fingerprint of a matrix and the options its numeric factorization
+// was run with: everything MatrixFingerprint hashes, plus the full effective
+// iparm. Two factor() (or factor_and_solve_stateful()) calls with an equal
+// fingerprint produce the same phase 22 result, so ValueIndex lets a later one
+// reuse the first one's slot instead of refactoring. Distinct from
+// MatrixFingerprint, which options deliberately do not perturb: this one
+// backs an opportunistic cache lookup, not the mismatch guard, so two
+// different option sets must never be treated as the same factorization here.
+uint64_t ContentFingerprint(MKL_INT matrix_type, MKL_INT dimension, const int32_t* indptr,
+                            const int32_t* indices, const double* values, const MKL_INT* iparm) {
+  FingerprintHasher hasher;
+  const int64_t entry_count = CombineShape(hasher, matrix_type, dimension, indptr);
+  for (int64_t i = 0; i < entry_count; ++i) {
+    hasher.Combine(static_cast<uint64_t>(static_cast<uint32_t>(indices[i])));
+    uint64_t bits;
+    std::memcpy(&bits, &values[i], sizeof(bits));
+    hasher.Combine(bits);
+  }
+  CombineIparm(hasher, iparm);
+  return hasher.value();
 }
 
 // Fills iparm with this package's defaults. iparm[0] is set to 1, meaning
@@ -234,6 +315,47 @@ std::atomic<long>& RebuildCounter() {
   return counter;
 }
 
+// Maps a pattern fingerprint (see PatternFingerprint) to the handle that last
+// analyzed it, so analyze() can hand back an existing slot for a pattern and
+// options it has already seen instead of re-running phase 11. One entry per
+// live pattern-holding slot: kept in sync with the registry by ForgetIfOwner
+// below, so it never outgrows it. Guarded by RegistryMutex, like Registry.
+std::unordered_map<uint64_t, int64_t>& PatternIndex() {
+  static std::unordered_map<uint64_t, int64_t> index;
+  return index;
+}
+
+// Maps a content fingerprint (see ContentFingerprint) to the handle that last
+// factored it, so factor() and factor_and_solve_stateful() can hand back an
+// existing slot for a matrix and options already factored elsewhere instead
+// of refactoring. Same bounding and locking as PatternIndex.
+std::unordered_map<uint64_t, int64_t>& ValueIndex() {
+  static std::unordered_map<uint64_t, int64_t> index;
+  return index;
+}
+
+// Counts how often analyze(), factor(), or factor_and_solve_stateful() found
+// an existing slot by fingerprint and reused it instead of doing the work
+// again. What dedup_hit_count() reports.
+std::atomic<long>& DedupHitCounter() {
+  static std::atomic<long> counter{0};
+  return counter;
+}
+
+// Erases index[fingerprint] only if it still points at owner. Used whenever a
+// slot stops representing the content a fingerprint was recorded for (evicted,
+// released, or overwritten with different content), so a stale entry never
+// misdirects a later lookup. The guard matters because, by then, a different,
+// newer slot may have already claimed the same fingerprint: erasing
+// unconditionally could take that mapping down instead of the stale one.
+void ForgetIfOwner(std::unordered_map<uint64_t, int64_t>& index, uint64_t fingerprint,
+                   int64_t owner) {
+  auto iterator = index.find(fingerprint);
+  if (iterator != index.end() && iterator->second == owner) {
+    index.erase(iterator);
+  }
+}
+
 // Cache size, from PARDISO_MKL_JAX_FACTOR_CACHE, defaulting to 8 live handles.
 // Read on every access rather than cached so a test can set it per case.
 size_t CacheCapacity() {
@@ -284,6 +406,10 @@ void EvictIfNeeded() {
     auto iterator = Registry().find(victim);
     if (iterator == Registry().end()) {
       continue;
+    }
+    ForgetIfOwner(PatternIndex(), iterator->second.pattern_fingerprint, victim);
+    if (iterator->second.has_factorization) {
+      ForgetIfOwner(ValueIndex(), iterator->second.content_key, victim);
     }
     FreeState(iterator->second);
     Registry().erase(iterator);
@@ -354,13 +480,29 @@ extern "C" void pardiso_reset_rebuild_count() {
   RebuildCounter().store(0);
 }
 
+// Total number of analyze()/factor()/factor_and_solve_stateful() calls that
+// reused an existing slot by fingerprint instead of redoing the work, since
+// load or the last reset. Process-wide, like RebuildCounter.
+extern "C" long pardiso_dedup_hit_count() {
+  return DedupHitCounter().load();
+}
+
+extern "C" void pardiso_reset_dedup_hit_count() {
+  DedupHitCounter().store(0);
+}
+
 namespace {
 
-// Analyze (phase 11). Allocates a fresh registry key, runs the symbolic
-// factorization into a new PardisoState, and returns the key as an int64
-// handle value. Every later stage (factor, solve, release) takes this
-// handle as an ordinary input, which is what lets XLA order the lifecycle by
-// data dependency instead of by a static, trace-time-baked id.
+// Analyze (phase 11). Two calls presenting the same pattern (matrix type,
+// dimension, indptr, indices) and the same options produce the same symbolic
+// factorization, so this first checks PatternIndex for a slot already holding
+// it and, if one is still live, hands back that handle instead of running
+// phase 11 again (a dedup hit, see dedup_hit_count). Otherwise it allocates a
+// fresh registry key, runs the analysis into a new PardisoState, and returns
+// the key as an int64 handle value. Every later stage (factor, solve,
+// release) takes this handle as an ordinary input, which is what lets XLA
+// order the lifecycle by data dependency instead of by a static,
+// trace-time-baked id.
 ffi::Error PardisoAnalyzeImpl(int64_t matrix_type, int64_t dimension,
                                ffi::Buffer<ffi::S32> indptr, ffi::Buffer<ffi::S32> indices,
                                ffi::Buffer<ffi::F64> values, ffi::Buffer<ffi::S32> options_mask,
@@ -368,14 +510,39 @@ ffi::Error PardisoAnalyzeImpl(int64_t matrix_type, int64_t dimension,
                                ffi::ResultBuffer<ffi::S64> handle_out,
                                ffi::ResultBuffer<ffi::S32> status,
                                ffi::ResultBuffer<ffi::S32> final_iparm) {
-  int64_t handle = HandleCounter().fetch_add(1);
+  // Computed once up front so the fingerprint below and the state actually
+  // analyzed, on a miss, use the exact same effective iparm.
+  MKL_INT effective_iparm[64] = {};
+  InitializeIparm(effective_iparm, static_cast<MKL_INT>(matrix_type));
+  ApplyOverlay(effective_iparm, options_mask.typed_data(), options_values.typed_data());
+  const uint64_t pattern_fingerprint =
+      PatternFingerprint(static_cast<MKL_INT>(matrix_type), static_cast<MKL_INT>(dimension),
+                         indptr.typed_data(), indices.typed_data(), effective_iparm);
 
   std::lock_guard<std::mutex> lock(RegistryMutex());
+
+  auto index_hit = PatternIndex().find(pattern_fingerprint);
+  if (index_hit != PatternIndex().end()) {
+    auto existing = Registry().find(index_hit->second);
+    if (existing != Registry().end() &&
+        existing->second.pattern_fingerprint == pattern_fingerprint) {
+      TouchLru(existing->first);
+      DedupHitCounter().fetch_add(1);
+      handle_out->typed_data()[0] = existing->first;
+      std::memcpy(final_iparm->typed_data(), existing->second.iparm, sizeof(MKL_INT) * 64);
+      status->typed_data()[0] = 0;
+      return ffi::Error::Success();
+    }
+    // Stale: the id it points to is gone, or was since repurposed by
+    // reanalyze() for a different pattern.
+    PatternIndex().erase(index_hit);
+  }
+
+  int64_t handle = HandleCounter().fetch_add(1);
   PardisoState& state = Registry()[handle];
   state.matrix_type = static_cast<MKL_INT>(matrix_type);
   state.dimension = static_cast<MKL_INT>(dimension);
-  InitializeIparm(state.iparm, state.matrix_type);
-  ApplyOverlay(state.iparm, options_mask.typed_data(), options_values.typed_data());
+  std::memcpy(state.iparm, effective_iparm, sizeof(MKL_INT) * 64);
 
   MKL_INT maxfct = 1;
   MKL_INT mnum = 1;
@@ -399,6 +566,10 @@ ffi::Error PardisoAnalyzeImpl(int64_t matrix_type, int64_t dimension,
   if (error != 0) {
     return ffi::Error::Internal(PardisoErrorMessage("analyze", error));
   }
+  // Record this handle's pattern only on success, so a failed analysis is
+  // never handed out to a later caller expecting a usable one.
+  state.pattern_fingerprint = pattern_fingerprint;
+  PatternIndex()[pattern_fingerprint] = handle;
   return ffi::Error::Success();
 }
 
@@ -444,6 +615,14 @@ ffi::Error PardisoReanalyzeImpl(int64_t matrix_type, int64_t dimension,
     RebuildCounter().fetch_add(1);
   }
   PardisoState& state = Registry()[handle];
+  // This handle is about to stop representing whatever pattern (and, if it
+  // had one, content) it stood for. Forget those index entries now, before
+  // they are overwritten below, so a later analyze()/factor() elsewhere never
+  // finds this handle under fingerprints it no longer matches.
+  ForgetIfOwner(PatternIndex(), state.pattern_fingerprint, handle);
+  if (state.has_factorization) {
+    ForgetIfOwner(ValueIndex(), state.content_key, handle);
+  }
 
   MKL_INT maxfct = 1;
   MKL_INT mnum = 1;
@@ -496,13 +675,28 @@ ffi::Error PardisoReanalyzeImpl(int64_t matrix_type, int64_t dimension,
   if (error != 0) {
     return ffi::Error::Internal(PardisoErrorMessage("reanalyze", error));
   }
+  // Record this handle's new pattern only on success. Unconditional: if
+  // another handle already claims this exact pattern, this handle simply
+  // stops being the canonical one a future analyze() finds for it, which
+  // costs that other handle nothing (it keeps working under its own id).
+  state.pattern_fingerprint =
+      PatternFingerprint(state.matrix_type, state.dimension, indptr.typed_data(),
+                         indices.typed_data(), state.iparm);
+  PatternIndex()[state.pattern_fingerprint] = handle;
   return ffi::Error::Success();
 }
 
 // Numeric factorization (phase 22) against the state already allocated by
-// analyze for this handle. Returns the same handle unchanged, so a later
-// solve that takes this handler's output as input is ordered after the
-// factorization.
+// analyze for this handle. Usually returns that same handle unchanged, so a
+// later solve that takes this handler's output as input is ordered after the
+// factorization. The exception is a dedup hit: if this exact matrix and
+// options are already factored into another live slot (shared from a common
+// analysis, or produced by an earlier call elsewhere), this hands back that
+// slot's handle instead of refactoring, so the returned handle can differ
+// from handle_in. A caller still holding handle_in for this matrix is
+// unaffected; one still holding it for a *different* matrix sees a mismatch
+// on its next solve and rebuilds (see PardisoSolveImpl), exactly as if this
+// call had refactored handle_in in place.
 ffi::Error PardisoFactorImpl(int64_t matrix_type, int64_t dimension,
                               ffi::Buffer<ffi::S64> handle_in, ffi::Buffer<ffi::S32> indptr,
                               ffi::Buffer<ffi::S32> indices, ffi::Buffer<ffi::F64> values,
@@ -513,7 +707,34 @@ ffi::Error PardisoFactorImpl(int64_t matrix_type, int64_t dimension,
                               ffi::ResultBuffer<ffi::S32> final_iparm) {
   int64_t handle = handle_in.typed_data()[0];
 
+  // Computed once up front so the content lookup below and the state
+  // actually factored, on a miss, use the exact same effective iparm.
+  MKL_INT effective_iparm[64] = {};
+  InitializeIparm(effective_iparm, static_cast<MKL_INT>(matrix_type));
+  ApplyOverlay(effective_iparm, options_mask.typed_data(), options_values.typed_data());
+  const uint64_t content_key =
+      ContentFingerprint(static_cast<MKL_INT>(matrix_type), static_cast<MKL_INT>(dimension),
+                        indptr.typed_data(), indices.typed_data(), values.typed_data(),
+                        effective_iparm);
+
   std::lock_guard<std::mutex> lock(RegistryMutex());
+
+  auto index_hit = ValueIndex().find(content_key);
+  if (index_hit != ValueIndex().end()) {
+    auto existing = Registry().find(index_hit->second);
+    if (existing != Registry().end() && existing->second.has_factorization &&
+        existing->second.content_key == content_key) {
+      TouchLru(existing->first);
+      DedupHitCounter().fetch_add(1);
+      handle_out->typed_data()[0] = existing->first;
+      std::memcpy(final_iparm->typed_data(), existing->second.iparm, sizeof(MKL_INT) * 64);
+      status->typed_data()[0] = 0;
+      return ffi::Error::Success();
+    }
+    // Stale: the id it points to is gone, or no longer holds this content.
+    ValueIndex().erase(index_hit);
+  }
+
   bool missing = Registry().find(handle) == Registry().end();
   handle_out->typed_data()[0] = handle;
   // A missing handle lost its analysis to eviction or release. We rebuild it
@@ -526,10 +747,16 @@ ffi::Error PardisoFactorImpl(int64_t matrix_type, int64_t dimension,
   }
 
   PardisoState& state = Registry()[handle];
+  // This slot is about to be overwritten with new content. Forget its old
+  // value-index entry first, if it had factors already, so a later factor()
+  // elsewhere never finds this handle under a fingerprint it no longer
+  // matches.
+  if (state.has_factorization) {
+    ForgetIfOwner(ValueIndex(), state.content_key, handle);
+  }
   state.matrix_type = static_cast<MKL_INT>(matrix_type);
   state.dimension = static_cast<MKL_INT>(dimension);
-  InitializeIparm(state.iparm, state.matrix_type);
-  ApplyOverlay(state.iparm, options_mask.typed_data(), options_values.typed_data());
+  std::memcpy(state.iparm, effective_iparm, sizeof(MKL_INT) * 64);
 
   if (missing) {
     RebuildCounter().fetch_add(1);
@@ -569,6 +796,10 @@ ffi::Error PardisoFactorImpl(int64_t matrix_type, int64_t dimension,
       MatrixFingerprint(state.matrix_type, state.dimension, indptr.typed_data(),
                         indices.typed_data(), values.typed_data());
   state.has_factorization = true;
+  // Record the same success under its content key too, so a later factor()
+  // call presenting this exact matrix and options elsewhere can reuse it.
+  state.content_key = content_key;
+  ValueIndex()[content_key] = handle;
   return ffi::Error::Success();
 }
 
@@ -789,6 +1020,10 @@ ffi::Error PardisoReleaseImpl(ffi::Buffer<ffi::S64> handle_in, ffi::Buffer<ffi::
     return ffi::Error::Success();
   }
   PardisoState& state = iterator->second;
+  ForgetIfOwner(PatternIndex(), state.pattern_fingerprint, handle);
+  if (state.has_factorization) {
+    ForgetIfOwner(ValueIndex(), state.content_key, handle);
+  }
 
   MKL_INT maxfct = 1;
   MKL_INT mnum = 1;

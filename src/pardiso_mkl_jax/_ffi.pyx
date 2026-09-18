@@ -28,6 +28,8 @@ cdef extern from "_pardiso_ffi.h":
     void pardiso_reset_analysis_count(long handle)
     long pardiso_rebuild_count()
     void pardiso_reset_rebuild_count()
+    long pardiso_dedup_hit_count()
+    void pardiso_reset_dedup_hit_count()
 
 
 cdef object _capsule(void* address):
@@ -108,3 +110,15 @@ def rebuild_count():
 def reset_rebuild_count():
     """Reset the rebuild counter to zero."""
     pardiso_reset_rebuild_count()
+
+
+def dedup_hit_count():
+    """Number of analyze()/factor() calls that reused an existing slot instead
+    of redoing the work, since load or the last reset.
+    """
+    return pardiso_dedup_hit_count()
+
+
+def reset_dedup_hit_count():
+    """Reset the dedup-hit counter to zero."""
+    pardiso_reset_dedup_hit_count()

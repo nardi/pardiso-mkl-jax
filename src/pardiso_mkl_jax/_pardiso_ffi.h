@@ -60,6 +60,12 @@ void pardiso_reset_analysis_count(long handle);
 long pardiso_rebuild_count();
 void pardiso_reset_rebuild_count();
 
+// Read and reset the process-wide dedup-hit counter. It rises whenever
+// analyze() or factor() finds an existing slot already holding the pattern or
+// matrix it was asked for and reuses it instead of redoing the work.
+long pardiso_dedup_hit_count();
+void pardiso_reset_dedup_hit_count();
+
 }  // extern "C"
 
 #endif  // PARDISO_MKL_JAX_FFI_H_

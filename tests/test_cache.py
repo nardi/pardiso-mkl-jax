@@ -38,10 +38,22 @@ def _dense_from_csr(indptr, indices, values):
     return dense
 
 
-def _analyze_factor(indptr, indices, values):
-    """Analyze then factor a system, returning a ready-to-solve token."""
-    token, _ = primitive.analyze(indptr, indices, values, matrix_type=MATRIX_TYPE)
-    token, _ = primitive.factor(token, indptr, indices, values, matrix_type=MATRIX_TYPE)
+def _analyze_factor(indptr, indices, values, salt=None):
+    """Analyze then factor a system, returning a ready-to-solve token.
+
+    analyze() shares a slot across calls presenting the same pattern and
+    options (see dedup_hit_count), so a test that wants several genuinely
+    distinct registry entries on the same pattern (to fill or evict the
+    cache, say) needs each call to differ in something the pattern
+    fingerprint covers. salt does that: a distinct int perturbs the options
+    overlay into an entry that does not otherwise affect correctness, giving
+    the call its own slot instead of landing on one from an earlier call.
+    """
+    options = {pmj.PardisoOption.MAX_ITERATIVE_REFINEMENT_STEPS: salt} if salt is not None else None
+    token, _ = primitive.analyze(indptr, indices, values, matrix_type=MATRIX_TYPE, options=options)
+    token, _ = primitive.factor(
+        token, indptr, indices, values, matrix_type=MATRIX_TYPE, options=options
+    )
     return token
 
 
@@ -59,10 +71,12 @@ def test_forgotten_handles_are_bounded_and_rebuild(any_system, monkeypatch):
     indptr, indices, values = map(jnp.asarray, (indptr, indices, values))
     monkeypatch.setenv("PARDISO_MKL_JAX_FACTOR_CACHE", "2")
 
-    # The first handle is the one we come back to; the loop evicts it.
+    # The first handle is the one we come back to; the loop evicts it. Each
+    # filler call is salted to its own slot, or they would all just dedup
+    # onto the first handle's own pattern and never fill the cache.
     first_handle = _analyze_factor(indptr, indices, values)
-    for _ in range(5):
-        _analyze_factor(indptr, indices, values)
+    for i in range(5):
+        _analyze_factor(indptr, indices, values, salt=i + 1)
 
     primitive.reset_rebuild_count()
     solution, _, _ = primitive.solve_stateful(
@@ -226,7 +240,7 @@ def test_rebuild_reason_reports_eviction(any_system, monkeypatch):
 
     monkeypatch.setenv("PARDISO_MKL_JAX_FACTOR_CACHE", "1")
     handle = _analyze_factor(indptr, indices, values)
-    _analyze_factor(indptr, indices, values)  # evicts handle (capacity 1)
+    _analyze_factor(indptr, indices, values, salt=1)  # a distinct slot; evicts handle (capacity 1)
 
     _solution, _final_iparm, reason = primitive.solve_stateful(
         handle,
@@ -260,8 +274,10 @@ def test_pardiso_solver_reports_rebuild_reason_through_diagnostics(any_system, m
     _first, diagnostics = solver.solve(right_hand_side, return_diagnostics=True)
     assert int(diagnostics.rebuild_reason) == pmj.RebuildReason.NONE
 
-    # Evict this solver's factorization by overrunning the single cache slot.
-    other = _analyze_factor(indptr, indices, values)
+    # Evict this solver's factorization by overrunning the single cache slot
+    # with a distinct one (salt keeps it from just landing back on the
+    # solver's own slot through analyze()'s pattern sharing).
+    other = _analyze_factor(indptr, indices, values, salt=1)
     del other
 
     _second, diagnostics = solver.solve(right_hand_side, return_diagnostics=True)

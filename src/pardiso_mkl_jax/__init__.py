@@ -17,7 +17,9 @@ from pardiso_mkl_jax.iparm import PardisoDiagnostics, PardisoOption, RebuildReas
 from pardiso_mkl_jax.matrix import MatrixType
 from pardiso_mkl_jax.primitive import (
     FactorizationToken,
+    dedup_hit_count,
     rebuild_count,
+    reset_dedup_hit_count,
     reset_rebuild_count,
     solve,
 )
@@ -30,7 +32,9 @@ __all__ = [
     "PardisoOption",
     "PardisoSolver",
     "RebuildReason",
+    "dedup_hit_count",
     "rebuild_count",
+    "reset_dedup_hit_count",
     "reset_rebuild_count",
     "solve",
 ]
