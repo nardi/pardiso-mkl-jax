@@ -18,7 +18,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/configure-pages@v6
+      # The documentation site uses the Tufte theme as a submodule.
       - uses: actions/checkout@v7
+        with:
+          submodules: recursive
       - uses: astral-sh/setup-uv@v7
       # --no-editable installs the compiled extension as real files rather
       # than through the meson-python editable loader, which mkdocstrings'
