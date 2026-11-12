@@ -248,6 +248,14 @@ third value. The reason is a
 call's [`PardisoDiagnostics`][pardiso_mkl_jax.PardisoDiagnostics] as
 `rebuild_reason`, so you can branch on it under `jax.jit`.
 
+Under `jax.vmap`, `factor` has a batching rule for values and for tokens. A
+batch over values returns a token with a batched id. The elements are factored
+in order, and each element takes the token that the previous element returned,
+so all elements share one analysis. Only the factorization of the last element
+is resident afterwards. A solve with the token of an earlier element rebuilds
+its factorization and reports `SUPERSEDED`. If nothing that `factor` reads is
+batched, the call stays unbatched.
+
 ### When is it safe to release explicitly?
 
 There are two aspects to distunguish here:

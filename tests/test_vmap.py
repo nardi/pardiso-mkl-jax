@@ -236,3 +236,158 @@ def test_vmap_stateful_rejects_batched_pattern(any_system):
 
     with pytest.raises(NotImplementedError, match="sparsity pattern"):
         jax.vmap(solve_one)(indices_batch, values_batch)
+
+
+# --- factor vmap rule ---
+
+
+def _reasons(reasons):
+    return [primitive.RebuildReason(int(reason)) for reason in np.asarray(reasons)]
+
+
+def test_vmap_factor_over_values(any_system):
+    """Batching values through factor gives one token per element, all solvable."""
+    indptr, indices, values, dense, right_hand_side = any_system
+    indptr, indices, values = map(jnp.asarray, (indptr, indices, values))
+    scales = jnp.asarray([21.0, 22.0, 23.0])
+    values_batch = values[None, :] * scales[:, None]
+
+    token, _ = primitive.analyze(indptr, indices, values * 21.0, matrix_type=MATRIX_TYPE)
+
+    def factor_one(batch_values):
+        return primitive.factor(token, indptr, indices, batch_values, matrix_type=MATRIX_TYPE)
+
+    batched_token, final_iparm, reason = jax.vmap(factor_one)(values_batch)
+    assert batched_token.id.shape == (3,)
+    assert final_iparm.shape == (3, 64)
+    assert _reasons(reason) == [primitive.RebuildReason.NONE] * 3
+
+    # Every element token solves correctly. Tokens of earlier elements were
+    # re-keyed by the chain, so they rebuild and report SUPERSEDED.
+    for index, scale in enumerate(np.asarray(scales)):
+        element_token = primitive.FactorizationToken(
+            batched_token.id[index], batched_token.n_dependent_solutions
+        )
+        solution, _, _ = primitive.solve_stateful(
+            element_token,
+            indptr,
+            indices,
+            values_batch[index],
+            jnp.asarray(right_hand_side)[None, :],
+            matrix_type=MATRIX_TYPE,
+        )
+        np.testing.assert_allclose(
+            np.asarray(solution[0]),
+            np.linalg.solve(dense * scale, right_hand_side),
+            rtol=1e-8,
+            atol=1e-10,
+        )
+
+
+def test_vmap_factor_rebuilds_missing_analysis_once(any_system):
+    """A chain rebuilds a missing analysis for the first element and not for the others."""
+    indptr, indices, values, _dense, _right_hand_side = any_system
+    indptr, indices, values = map(jnp.asarray, (indptr, indices, values))
+    token, _ = primitive.analyze(indptr, indices, values * 24.0, matrix_type=MATRIX_TYPE)
+    primitive.release(token)
+    values_batch = values[None, :] * jnp.asarray([25.0, 26.0, 27.0])[:, None]
+
+    primitive.reset_rebuild_count()
+    _, _, reason = jax.vmap(
+        lambda batch_values: primitive.factor(
+            token, indptr, indices, batch_values, matrix_type=MATRIX_TYPE
+        )
+    )(values_batch)
+    assert _reasons(reason) == [
+        primitive.RebuildReason.FREED,
+        primitive.RebuildReason.NONE,
+        primitive.RebuildReason.NONE,
+    ]
+    assert primitive.rebuild_count() == 1
+
+
+def test_vmap_factor_with_batched_token(any_system):
+    """A batched token gives each element its own input, so there is no chain."""
+    indptr, indices, values, dense, right_hand_side = any_system
+    indptr, indices, values = map(jnp.asarray, (indptr, indices, values))
+    scales = [28.0, 29.0]
+    tokens = [
+        primitive.analyze(indptr, indices, values * scale, matrix_type=MATRIX_TYPE)[0]
+        for scale in scales
+    ]
+    batched_token = jax.tree_util.tree_map(lambda *leaves: jnp.stack(leaves), *tokens)
+    values_batch = values[None, :] * jnp.asarray(scales)[:, None]
+
+    new_token, _, reason = jax.vmap(
+        lambda token, batch_values: primitive.factor(
+            token, indptr, indices, batch_values, matrix_type=MATRIX_TYPE
+        )
+    )(batched_token, values_batch)
+    assert _reasons(reason) == [primitive.RebuildReason.NONE] * 2
+    for index, scale in enumerate(scales):
+        element_token = primitive.FactorizationToken(
+            new_token.id[index], new_token.n_dependent_solutions
+        )
+        solution, _, solve_reason = primitive.solve_stateful(
+            element_token,
+            indptr,
+            indices,
+            values_batch[index],
+            jnp.asarray(right_hand_side)[None, :],
+            matrix_type=MATRIX_TYPE,
+        )
+        # Both elements own a separate analysis, so both factorizations are resident.
+        assert primitive.RebuildReason(int(solve_reason)) == primitive.RebuildReason.NONE
+        np.testing.assert_allclose(
+            np.asarray(solution[0]),
+            np.linalg.solve(dense * scale, right_hand_side),
+            rtol=1e-8,
+            atol=1e-10,
+        )
+
+
+def test_vmap_factor_with_only_right_hand_side_batched(any_system):
+    """A batched right-hand side that flows through a refactoring loop needs no batched factor."""
+    indptr, indices, values, dense, _right_hand_side = any_system
+    indptr, indices, values = map(jnp.asarray, (indptr, indices, values))
+    batch_size = 3
+    rhs_batch = jnp.asarray(np.random.default_rng(30).uniform(-1, 1, (batch_size, dense.shape[0])))
+    token, _ = primitive.analyze(indptr, indices, values, matrix_type=MATRIX_TYPE)
+
+    def refactor_loop(right_hand_side):
+        def body(carry, _):
+            loop_values = values * 1.5
+            new_token, _, _ = primitive.factor(
+                token, indptr, indices, loop_values, matrix_type=MATRIX_TYPE
+            )
+            solution, _, _ = primitive.solve_stateful(
+                new_token,
+                indptr,
+                indices,
+                loop_values,
+                (carry)[None, :],
+                matrix_type=MATRIX_TYPE,
+            )
+            return solution[0], None
+
+        result, _ = jax.lax.scan(body, right_hand_side, None, length=2)
+        return result
+
+    batched = jax.vmap(refactor_loop)(rhs_batch)
+    expected = np.linalg.solve(dense * 1.5, np.linalg.solve(dense * 1.5, np.asarray(rhs_batch).T))
+    np.testing.assert_allclose(np.asarray(batched), expected.T, rtol=1e-8, atol=1e-10)
+
+
+def test_vmap_factor_rejects_batched_pattern(any_system):
+    """Batching indptr or indices through factor raises the shared pattern error."""
+    indptr, indices, values, _dense, _right_hand_side = any_system
+    indptr, indices, values = map(jnp.asarray, (indptr, indices, values))
+    token, _ = primitive.analyze(indptr, indices, values, matrix_type=MATRIX_TYPE)
+    indices_batch = jnp.stack([indices, indices])
+
+    with pytest.raises(NotImplementedError, match="sparsity pattern"):
+        jax.vmap(
+            lambda batch_indices: primitive.factor(
+                token, indptr, batch_indices, values, matrix_type=MATRIX_TYPE
+            )
+        )(indices_batch)
