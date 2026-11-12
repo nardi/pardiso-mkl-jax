@@ -276,11 +276,81 @@ def factor(token, indptr, indices, values, *, matrix_type: MatrixType, options: 
     array as Pardiso left it, for decoding into a PardisoDiagnostics.
     rebuild_reason is a RebuildReason that says why the analysis was rebuilt,
     or NONE if it was resident.
+
+    Under jax.vmap, a batch over values returns a token with a batched id.
+    Every element has its own analysis and its own factorization, so all
+    factorizations are resident together. Element 0 takes the input token. Each
+    other element analyzes its own values, which adds one analysis for each of
+    them. The cache size limit still applies. An evicted factorization is
+    rebuilt on its next use. If the token is batched too, element i takes
+    element i of the token and no extra analysis runs.
     """
-    handle_out, final_iparm, rebuild_reason = _factor_call(
-        token.id, indptr, indices, values, MatrixType(matrix_type), canonicalize_overlay(options)
-    )
+    overlay_key = canonicalize_overlay(options)
+    core = _make_factor_core(MatrixType(matrix_type), overlay_key)
+    handle_out, final_iparm, rebuild_reason = core(token.id, indptr, indices, values)
     return FactorizationToken(handle_out, jnp.zeros((), jnp.int32)), final_iparm, rebuild_reason
+
+
+@functools.cache
+def _make_factor_core(matrix_type: MatrixType, overlay_key: tuple[tuple[int, int], ...]):
+    """Build a custom_vmap-decorated factor function for one (matrix_type, overlay) pair.
+
+    Same closure-capture pattern as _make_solve_core. The core returns
+    (handle, final_iparm, rebuild_reason).
+    """
+
+    @jax.custom_batching.custom_vmap
+    def factor_core(token_id, indptr, indices, values):
+        return _factor_call(token_id, indptr, indices, values, matrix_type, overlay_key)
+
+    @factor_core.def_vmap
+    def vmap_rule(axis_size, in_batched, token_id, indptr, indices, values):
+        token_id_batched, indptr_batched, indices_batched, values_batched = in_batched
+        if indptr_batched or indices_batched:
+            raise NotImplementedError(
+                "vmap over indptr or indices is not supported: every matrix in a batch must "
+                "share the same sparsity pattern. Batch over values instead."
+            )
+
+        if not token_id_batched and not values_batched:
+            # Nothing that factor reads is batched. This happens when, for
+            # example, only a right-hand side is batched in a larger program.
+            result = factor_core(token_id, indptr, indices, values)
+            return result, (False, False, False)
+
+        # The native call re-keys its input token, so two elements that share
+        # one token would break each other. Each element therefore needs its
+        # own analysis. Element 0 takes the input token, and every other
+        # element analyzes its own values. A batched token already gives each
+        # element its own input.
+        handles = []
+        iparms = []
+        reasons = []
+        for index in range(axis_size):
+            current_values = values[index] if values_batched else values
+            if token_id_batched:
+                current_id = token_id[index]
+            elif index == 0:
+                current_id = token_id
+            else:
+                element_token, _ = analyze(
+                    indptr,
+                    indices,
+                    current_values,
+                    matrix_type=matrix_type,
+                    options=overlay_key,
+                )
+                current_id = element_token.id
+            handle, iparm, reason = factor_core(current_id, indptr, indices, current_values)
+            handles.append(handle)
+            iparms.append(iparm)
+            reasons.append(reason)
+        return (
+            (jnp.stack(handles), jnp.stack(iparms), jnp.stack(reasons)),
+            (True, True, True),
+        )
+
+    return factor_core
 
 
 def _factor_call(token_id, indptr, indices, values, matrix_type, overlay_key):
