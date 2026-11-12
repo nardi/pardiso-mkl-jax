@@ -369,9 +369,9 @@ class PardisoDiagnostics:
     """All 64 iparm entries, for anything not decoded into a named field above."""
 
     rebuild_reason: jax.Array
-    """Whether the solve reused a cached factorization or rebuilt one, as a
+    """Whether the call reused a cached factorization or rebuilt one, as a
     RebuildReason value (see pardiso_mkl_jax.primitive). NONE (0) on a cache hit,
-    and on calls where the question does not apply (analyze, factor, and the
+    and on calls where the question does not apply (analyze, reanalyze, and the
     functional solve, which never reuses a factorization)."""
 
     @staticmethod

@@ -85,8 +85,8 @@ class RebuildReason(enum.IntEnum):
     the bounded cache, FREED was released, SUPERSEDED was re-keyed by a refactor
     so a stale alias was used, and UNKNOWN was never resident or its tombstone
     aged out. DTYPE and STALE are reserved so the numbering matches
-    splineax-klujax. solve_stateful and factor_and_solve_stateful return one per
-    call, and rebuild_stats totals them.
+    splineax-klujax. factor, solve_stateful and factor_and_solve_stateful return
+    one per call, and rebuild_stats totals them.
     """
 
     NONE = 0
@@ -266,26 +266,95 @@ def reanalyze(
 def factor(token, indptr, indices, values, *, matrix_type: MatrixType, options: OptionsLike = None):
     """Run the numeric factorization (phase 22) step against token.
 
-    Returns (new_token, final_iparm). The returned token's id is a content hash
-    of the factorization, distinct from the analyze token's id, so a later call
-    that consumes it is ordered after the factorization it performed. When the
-    analyze token is still resident, its analysis is reused and re-keyed to the
-    new token. When it is gone, the whole analyze then factor chain is rebuilt
-    from the matrix this call carries. The returned token's solve counter is
-    reset to zero. final_iparm is the complete iparm array as Pardiso left it,
-    for decoding into a PardisoDiagnostics.
+    Returns (new_token, final_iparm, rebuild_reason). The returned token's id is
+    a content hash of the factorization, distinct from the analyze token's id,
+    so a later call that consumes it is ordered after the factorization it
+    performed. When the analyze token is still resident, its analysis is reused
+    and re-keyed to the new token. When it is gone, the whole analyze then
+    factor chain is rebuilt from the matrix this call carries. The returned
+    token's solve counter is reset to zero. final_iparm is the complete iparm
+    array as Pardiso left it, for decoding into a PardisoDiagnostics.
+    rebuild_reason is a RebuildReason that says why the analysis was rebuilt,
+    or NONE if it was resident.
+
+    Under jax.vmap, a batch over values returns a token with a batched id. The
+    elements are factored in order, and each element takes the token that the
+    previous element returned. All elements share one analysis. Only the
+    factorization of the last element is resident afterwards. A solve with the
+    token of an earlier element rebuilds it and reports SUPERSEDED.
     """
+    overlay_key = canonicalize_overlay(options)
+    core = _make_factor_core(MatrixType(matrix_type), overlay_key)
+    handle_out, final_iparm, rebuild_reason = core(token.id, indptr, indices, values)
+    return FactorizationToken(handle_out, jnp.zeros((), jnp.int32)), final_iparm, rebuild_reason
+
+
+@functools.cache
+def _make_factor_core(matrix_type: MatrixType, overlay_key: tuple[tuple[int, int], ...]):
+    """Build a custom_vmap-decorated factor function for one (matrix_type, overlay) pair.
+
+    Same closure-capture pattern as _make_solve_core. The core returns
+    (handle, final_iparm, rebuild_reason).
+    """
+
+    @jax.custom_batching.custom_vmap
+    def factor_core(token_id, indptr, indices, values):
+        return _factor_call(token_id, indptr, indices, values, matrix_type, overlay_key)
+
+    @factor_core.def_vmap
+    def vmap_rule(axis_size, in_batched, token_id, indptr, indices, values):
+        token_id_batched, indptr_batched, indices_batched, values_batched = in_batched
+        if indptr_batched or indices_batched:
+            raise NotImplementedError(
+                "vmap over indptr or indices is not supported: every matrix in a batch must "
+                "share the same sparsity pattern. Batch over values instead."
+            )
+
+        if not token_id_batched and not values_batched:
+            # Nothing that factor reads is batched. This happens when, for
+            # example, only a right-hand side is batched in a larger program.
+            result = factor_core(token_id, indptr, indices, values)
+            return result, (False, False, False)
+
+        # The native call re-keys its input token, so calls that share one
+        # input token would each rebuild the analysis. A chain avoids that.
+        # Element i takes the token that element i - 1 returned, which also
+        # fixes the order of the calls by data dependency. A batched token
+        # gives each element its own input instead, so there is no chain.
+        handles = []
+        iparms = []
+        reasons = []
+        current_id = token_id
+        for index in range(axis_size):
+            if token_id_batched:
+                current_id = token_id[index]
+            current_values = values[index] if values_batched else values
+            current_id, iparm, reason = factor_core(current_id, indptr, indices, current_values)
+            handles.append(current_id)
+            iparms.append(iparm)
+            reasons.append(reason)
+        return (
+            (jnp.stack(handles), jnp.stack(iparms), jnp.stack(reasons)),
+            (True, True, True),
+        )
+
+    return factor_core
+
+
+def _factor_call(token_id, indptr, indices, values, matrix_type, overlay_key):
+    """Call the native factor target once. Returns (handle, final_iparm, rebuild_reason)."""
     dimension = indptr.shape[0] - 1
-    overlay_mask, overlay_values = _overlay_buffers(options)
-    handle_out, _status, final_iparm = jax.ffi.ffi_call(
+    overlay_mask, overlay_values = _overlay_buffers(overlay_key)
+    handle_out, _status, final_iparm, rebuild_reason = jax.ffi.ffi_call(
         "pardiso_mkl_jax_factor",
         (
             jax.ShapeDtypeStruct((), jnp.uint64),
             jax.ShapeDtypeStruct((), jnp.int32),
             jax.ShapeDtypeStruct((64,), jnp.int32),
+            jax.ShapeDtypeStruct((), jnp.int32),
         ),
     )(
-        token.id,
+        token_id,
         indptr,
         indices,
         values,
@@ -294,7 +363,7 @@ def factor(token, indptr, indices, values, *, matrix_type: MatrixType, options: 
         matrix_type=np.int64(matrix_type),
         dimension=np.int64(dimension),
     )
-    return FactorizationToken(handle_out, jnp.zeros((), jnp.int32)), final_iparm
+    return handle_out, final_iparm, rebuild_reason
 
 
 @functools.cache
@@ -663,14 +732,14 @@ def _make_solve_core(
                 indptr, indices, values[0], matrix_type=matrix_type, options=overlay_key
             )
             try:
-                handle, _final_iparm = factor(
+                handle, _final_iparm, _reason = factor(
                     handle, indptr, indices, values[0], matrix_type=matrix_type, options=overlay_key
                 )
                 solutions = []
                 diagnostics_per_element = []
                 for index in range(axis_size):
                     if index > 0:
-                        handle, _final_iparm = factor(
+                        handle, _final_iparm, _reason = factor(
                             handle,
                             indptr,
                             indices,
