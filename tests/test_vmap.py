@@ -132,7 +132,7 @@ def test_vmap_over_pattern_arrays_is_rejected(system):
 def _analyze_factor(indptr, indices, values):
     """Analyze then factor, returning a ready-to-solve token."""
     token, _ = primitive.analyze(indptr, indices, values, matrix_type=MATRIX_TYPE)
-    token, _ = primitive.factor(token, indptr, indices, values, matrix_type=MATRIX_TYPE)
+    token, _, _ = primitive.factor(token, indptr, indices, values, matrix_type=MATRIX_TYPE)
     return token
 
 

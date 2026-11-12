@@ -589,7 +589,8 @@ ffi::Error PardisoReanalyzeImpl(int64_t matrix_type, int64_t dimension,
 // When the input analysis is resident, its pt is reused (the analysis is not
 // redone) and re-keyed to the factor key, so a stale alias of the analysis
 // handle rebuilds. When it is gone, the whole analyze then factor chain is
-// rebuilt from the carried matrix.
+// rebuilt from the carried matrix. In that case rebuild_reason says why the
+// analysis was gone. It is NONE in every other case.
 ffi::Error PardisoFactorImpl(int64_t matrix_type, int64_t dimension,
                               ffi::Buffer<ffi::U64> handle_in, ffi::Buffer<ffi::S32> indptr,
                               ffi::Buffer<ffi::S32> indices, ffi::Buffer<ffi::F64> values,
@@ -597,7 +598,9 @@ ffi::Error PardisoFactorImpl(int64_t matrix_type, int64_t dimension,
                               ffi::Buffer<ffi::S32> options_values,
                               ffi::ResultBuffer<ffi::U64> handle_out,
                               ffi::ResultBuffer<ffi::S32> status,
-                              ffi::ResultBuffer<ffi::S32> final_iparm) {
+                              ffi::ResultBuffer<ffi::S32> final_iparm,
+                              ffi::ResultBuffer<ffi::S32> rebuild_reason) {
+  rebuild_reason->typed_data()[0] = static_cast<int32_t>(RebuildReason::NONE);
   uint64_t in_key = handle_in.typed_data()[0];
   MKL_INT mtype = static_cast<MKL_INT>(matrix_type);
   MKL_INT dim = static_cast<MKL_INT>(dimension);
@@ -638,7 +641,9 @@ ffi::Error PardisoFactorImpl(int64_t matrix_type, int64_t dimension,
       return ffi::Error::Internal("pardiso factor: analysis handle was evicted or freed and "
                                   "strict cache mode is on");
     }
-    NoteRebuild(TombstoneReason(in_key));
+    RebuildReason reason = TombstoneReason(in_key);
+    rebuild_reason->typed_data()[0] = static_cast<int32_t>(reason);
+    NoteRebuild(reason);
     PrepareIparm(entry.state, mtype, dim, options_mask.typed_data(), options_values.typed_data());
     MKL_INT analyze_error = RunAnalysis(entry.state, indptr.typed_data(), indices.typed_data(),
                                         values.typed_data());
@@ -955,6 +960,7 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(kPardisoFactorHandler, PardisoFactorImpl,
                                    .Ret<ffi::Buffer<ffi::U64>>()  // handle
                                    .Ret<ffi::Buffer<ffi::S32>>()  // status
                                    .Ret<ffi::Buffer<ffi::S32>>()  // final_iparm
+                                   .Ret<ffi::Buffer<ffi::S32>>()  // rebuild_reason
 );
 
 XLA_FFI_DEFINE_HANDLER_SYMBOL(kPardisoSolveHandler, PardisoSolveImpl,

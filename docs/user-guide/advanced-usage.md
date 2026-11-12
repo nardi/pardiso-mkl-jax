@@ -239,9 +239,11 @@ find that:
   slowing things down. Leave it off in production and switch it on while
   debugging performance.
 
-The `solve` and `refactor_and_solve` methods, and the low-level
-`solve_stateful` and `factor_and_solve_stateful` primitives, report per call
-whether they reused a cached factorization or rebuilt one. The reason is a
+The `solve`, `factorize`, `refactorize` and `refactor_and_solve` methods, and
+the low-level `factor`, `solve_stateful` and `factor_and_solve_stateful`
+primitives, report per call whether they reused a cached analysis or
+factorization or rebuilt one. The `factor` primitive returns the reason as its
+third value. The reason is a
 [`RebuildReason`][pardiso_mkl_jax.RebuildReason] carried on the
 call's [`PardisoDiagnostics`][pardiso_mkl_jax.PardisoDiagnostics] as
 `rebuild_reason`, so you can branch on it under `jax.jit`.
@@ -275,7 +277,7 @@ right_hand_side = jnp.array([1.0, 2.0, 3.0], dtype=jnp.float64)
 matrix_type = pmj.MatrixType.REAL_NONSYMMETRIC
 
 token, _ = primitive.analyze(indptr, indices, values, matrix_type=matrix_type)
-token, _ = primitive.factor(token, indptr, indices, values, matrix_type=matrix_type)
+token, _, _ = primitive.factor(token, indptr, indices, values, matrix_type=matrix_type)
 
 solution, _, _ = primitive.solve_stateful(
     token, indptr, indices, values, right_hand_side[None, :], matrix_type=matrix_type
@@ -308,7 +310,7 @@ right_hand_side = jnp.array([1.0, 2.0, 3.0], dtype=jnp.float64)
 matrix_type = pmj.MatrixType.REAL_NONSYMMETRIC
 
 token, _ = primitive.analyze(indptr, indices, values, matrix_type=matrix_type)
-token, _ = primitive.factor(token, indptr, indices, values, matrix_type=matrix_type)
+token, _, _ = primitive.factor(token, indptr, indices, values, matrix_type=matrix_type)
 
 
 @jax.jit

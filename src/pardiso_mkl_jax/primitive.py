@@ -85,8 +85,8 @@ class RebuildReason(enum.IntEnum):
     the bounded cache, FREED was released, SUPERSEDED was re-keyed by a refactor
     so a stale alias was used, and UNKNOWN was never resident or its tombstone
     aged out. DTYPE and STALE are reserved so the numbering matches
-    splineax-klujax. solve_stateful and factor_and_solve_stateful return one per
-    call, and rebuild_stats totals them.
+    splineax-klujax. factor, solve_stateful and factor_and_solve_stateful return
+    one per call, and rebuild_stats totals them.
     """
 
     NONE = 0
@@ -266,26 +266,37 @@ def reanalyze(
 def factor(token, indptr, indices, values, *, matrix_type: MatrixType, options: OptionsLike = None):
     """Run the numeric factorization (phase 22) step against token.
 
-    Returns (new_token, final_iparm). The returned token's id is a content hash
-    of the factorization, distinct from the analyze token's id, so a later call
-    that consumes it is ordered after the factorization it performed. When the
-    analyze token is still resident, its analysis is reused and re-keyed to the
-    new token. When it is gone, the whole analyze then factor chain is rebuilt
-    from the matrix this call carries. The returned token's solve counter is
-    reset to zero. final_iparm is the complete iparm array as Pardiso left it,
-    for decoding into a PardisoDiagnostics.
+    Returns (new_token, final_iparm, rebuild_reason). The returned token's id is
+    a content hash of the factorization, distinct from the analyze token's id,
+    so a later call that consumes it is ordered after the factorization it
+    performed. When the analyze token is still resident, its analysis is reused
+    and re-keyed to the new token. When it is gone, the whole analyze then
+    factor chain is rebuilt from the matrix this call carries. The returned
+    token's solve counter is reset to zero. final_iparm is the complete iparm
+    array as Pardiso left it, for decoding into a PardisoDiagnostics.
+    rebuild_reason is a RebuildReason that says why the analysis was rebuilt,
+    or NONE if it was resident.
     """
+    handle_out, final_iparm, rebuild_reason = _factor_call(
+        token.id, indptr, indices, values, MatrixType(matrix_type), canonicalize_overlay(options)
+    )
+    return FactorizationToken(handle_out, jnp.zeros((), jnp.int32)), final_iparm, rebuild_reason
+
+
+def _factor_call(token_id, indptr, indices, values, matrix_type, overlay_key):
+    """Call the native factor target once. Returns (handle, final_iparm, rebuild_reason)."""
     dimension = indptr.shape[0] - 1
-    overlay_mask, overlay_values = _overlay_buffers(options)
-    handle_out, _status, final_iparm = jax.ffi.ffi_call(
+    overlay_mask, overlay_values = _overlay_buffers(overlay_key)
+    handle_out, _status, final_iparm, rebuild_reason = jax.ffi.ffi_call(
         "pardiso_mkl_jax_factor",
         (
             jax.ShapeDtypeStruct((), jnp.uint64),
             jax.ShapeDtypeStruct((), jnp.int32),
             jax.ShapeDtypeStruct((64,), jnp.int32),
+            jax.ShapeDtypeStruct((), jnp.int32),
         ),
     )(
-        token.id,
+        token_id,
         indptr,
         indices,
         values,
@@ -294,7 +305,7 @@ def factor(token, indptr, indices, values, *, matrix_type: MatrixType, options: 
         matrix_type=np.int64(matrix_type),
         dimension=np.int64(dimension),
     )
-    return FactorizationToken(handle_out, jnp.zeros((), jnp.int32)), final_iparm
+    return handle_out, final_iparm, rebuild_reason
 
 
 @functools.cache
@@ -663,14 +674,14 @@ def _make_solve_core(
                 indptr, indices, values[0], matrix_type=matrix_type, options=overlay_key
             )
             try:
-                handle, _final_iparm = factor(
+                handle, _final_iparm, _reason = factor(
                     handle, indptr, indices, values[0], matrix_type=matrix_type, options=overlay_key
                 )
                 solutions = []
                 diagnostics_per_element = []
                 for index in range(axis_size):
                     if index > 0:
-                        handle, _final_iparm = factor(
+                        handle, _final_iparm, _reason = factor(
                             handle,
                             indptr,
                             indices,
