@@ -248,6 +248,14 @@ third value. The reason is a
 call's [`PardisoDiagnostics`][pardiso_mkl_jax.PardisoDiagnostics] as
 `rebuild_reason`, so you can branch on it under `jax.jit`.
 
+Under `jax.vmap`, `factor` has a batching rule for values and for tokens. A
+batch over values returns a token with a batched id. Every element has its own
+analysis and its own factorization, so all factorizations are resident
+together. Element 0 takes the input token. Each other element analyzes its own
+values, which adds one analysis for each of them. The cache size limit still
+applies, and an evicted factorization is rebuilt on its next use. If nothing
+that `factor` reads is batched, the call stays unbatched.
+
 ### When is it safe to release explicitly?
 
 There are two aspects to distunguish here:
