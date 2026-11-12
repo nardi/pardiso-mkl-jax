@@ -342,13 +342,13 @@ def test_reanalyze_primitive_inside_and_outside_jit(system):
 
     def run(first_values, second_values, right_hand_side):
         handle, _iparm = primitive.analyze(indptr, indices, first_values, matrix_type=matrix_type)
-        handle, _iparm = primitive.factor(
+        handle, _iparm, _reason = primitive.factor(
             handle, indptr, indices, first_values, matrix_type=matrix_type
         )
         handle, _iparm = primitive.reanalyze(
             handle, indptr, indices, second_values, matrix_type=matrix_type
         )
-        handle, _iparm = primitive.factor(
+        handle, _iparm, _reason = primitive.factor(
             handle, indptr, indices, second_values, matrix_type=matrix_type
         )
         solution, _iparm, _reason = primitive.solve_stateful(
@@ -400,7 +400,9 @@ def test_reanalyze_rebuilds_an_evicted_handle(any_system):
     handle, _iparm = primitive.reanalyze(handle, indptr, indices, values, matrix_type=matrix_type)
     assert primitive.rebuild_count() == 1
 
-    handle, _iparm = primitive.factor(handle, indptr, indices, values, matrix_type=matrix_type)
+    handle, _iparm, _reason = primitive.factor(
+        handle, indptr, indices, values, matrix_type=matrix_type
+    )
     stacked_rhs = jnp.asarray(right_hand_side)[None, :]
     solution, _iparm, _reason = primitive.solve_stateful(
         handle, indptr, indices, values, stacked_rhs, matrix_type=matrix_type
@@ -505,3 +507,25 @@ def test_close_is_idempotent(any_system):
     # __exit__ already closed it; closing again must not raise.
     solver.close()
     solver.close()
+
+
+def test_factorize_reports_rebuild_reason(any_system, monkeypatch):
+    """The diagnostics of factorize carry the reason for a rebuilt analysis."""
+    indptr, indices, values, _dense, _right_hand_side = any_system
+    indptr, indices, values = map(jnp.asarray, (indptr, indices, values))
+    monkeypatch.setenv("PARDISO_MKL_JAX_FACTOR_CACHE", "1")
+    matrix_type = pmj.MatrixType.REAL_NONSYMMETRIC
+    with pmj.PardisoSolver(indptr, indices, matrix_type=matrix_type) as solver:
+        solver.analyze(values * 18.0)
+        diagnostics = solver.factorize(values * 18.0, return_diagnostics=True)
+        assert primitive.RebuildReason(int(diagnostics.rebuild_reason)) == (
+            primitive.RebuildReason.NONE
+        )
+
+        # Analysis of another matrix evicts the analysis of the solver at capacity 1.
+        solver.analyze(values * 19.0)
+        primitive.analyze(indptr, indices, values * 20.0, matrix_type=matrix_type)
+        diagnostics = solver.factorize(values * 21.0, return_diagnostics=True)
+        assert primitive.RebuildReason(int(diagnostics.rebuild_reason)) == (
+            primitive.RebuildReason.EVICTED
+        )

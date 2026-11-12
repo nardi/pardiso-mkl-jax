@@ -177,8 +177,8 @@ class PardisoSolver:
     def _record_diagnostics(self, final_iparm, rebuild_reason=None) -> PardisoDiagnostics:
         """Decode diagnostics, store them on the solver, and return them.
 
-        rebuild_reason is the per-call RebuildReason from a stateful solve, or
-        None for calls where a cache hit or miss does not apply. Stores None on
+        rebuild_reason is the per-call RebuildReason from a factor or a stateful
+        solve, or None for calls where a cache hit or miss does not apply. Stores None on
         the solver instead when final_iparm is a tracer, which it is whenever
         the call is running under jit. Keeping the decoded tracer would leak it
         out of its trace, so reading last_diagnostics afterwards would raise
@@ -340,7 +340,7 @@ class PardisoSolver:
         check_csr_arrays(self._indptr, self._indices, values)
         overlay = self._merge(options)
         self._check_pivot_settings(overlay, stage)
-        self._handle, final_iparm = primitive.factor(
+        self._handle, final_iparm, rebuild_reason = primitive.factor(
             self._handle,
             self._indptr,
             self._indices,
@@ -349,7 +349,7 @@ class PardisoSolver:
             options=overlay,
         )
         self._values = values
-        return self._record_diagnostics(final_iparm)
+        return self._record_diagnostics(final_iparm, rebuild_reason)
 
     def solve(
         self,

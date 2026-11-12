@@ -23,7 +23,7 @@ MATRIX_TYPE = pmj.MatrixType.REAL_NONSYMMETRIC
 def _analyze_factor(indptr, indices, values):
     """Analyze then factor a system, returning a ready-to-solve token."""
     token, _ = primitive.analyze(indptr, indices, values, matrix_type=MATRIX_TYPE)
-    token, _ = primitive.factor(token, indptr, indices, values, matrix_type=MATRIX_TYPE)
+    token, _, _ = primitive.factor(token, indptr, indices, values, matrix_type=MATRIX_TYPE)
     return token
 
 
@@ -133,7 +133,7 @@ def test_full_lifecycle_inside_jit(any_system):
     @jax.jit
     def run(rhs):
         handle, _ = primitive.analyze(indptr, indices, values, matrix_type=MATRIX_TYPE)
-        handle, _ = primitive.factor(handle, indptr, indices, values, matrix_type=MATRIX_TYPE)
+        handle, _, _ = primitive.factor(handle, indptr, indices, values, matrix_type=MATRIX_TYPE)
         solution, _, _ = primitive.solve_stateful(
             handle, indptr, indices, values, rhs[None, :], matrix_type=MATRIX_TYPE
         )
@@ -359,9 +359,9 @@ def test_cse_merged_factor_stays_correct(any_system):
 
     def run(values, rhs):
         token_a, _ = primitive.analyze(indptr, indices, values, matrix_type=MATRIX_TYPE)
-        token_a, _ = primitive.factor(token_a, indptr, indices, values, matrix_type=MATRIX_TYPE)
+        token_a, _, _ = primitive.factor(token_a, indptr, indices, values, matrix_type=MATRIX_TYPE)
         token_b, _ = primitive.analyze(indptr, indices, values, matrix_type=MATRIX_TYPE)
-        token_b, _ = primitive.factor(token_b, indptr, indices, values, matrix_type=MATRIX_TYPE)
+        token_b, _, _ = primitive.factor(token_b, indptr, indices, values, matrix_type=MATRIX_TYPE)
         first, _, _ = primitive.solve_stateful(
             token_a, indptr, indices, values, rhs[None, :], matrix_type=MATRIX_TYPE
         )
@@ -396,7 +396,7 @@ def test_alias_refactor_supersedes(any_system):
     new_values = values * scale
 
     old = _analyze_factor(indptr, indices, values)
-    new, _ = primitive.factor(old, indptr, indices, new_values, matrix_type=MATRIX_TYPE)
+    new, _, _ = primitive.factor(old, indptr, indices, new_values, matrix_type=MATRIX_TYPE)
 
     stale, _, stale_reason = primitive.solve_stateful(
         old, indptr, indices, values, rhs, matrix_type=MATRIX_TYPE
@@ -446,3 +446,74 @@ def test_residency_does_not_change_the_answer(any_system, monkeypatch):
 
     np.testing.assert_allclose(np.asarray(resident[0]), expected, rtol=1e-8, atol=1e-10)
     np.testing.assert_allclose(np.asarray(rebuilt[0]), expected, rtol=1e-8, atol=1e-10)
+
+
+def _reason_of_factor(token, indptr, indices, values):
+    """Run factor and return its RebuildReason."""
+    _, _, reason = primitive.factor(token, indptr, indices, values, matrix_type=MATRIX_TYPE)
+    return primitive.RebuildReason(int(reason))
+
+
+def test_factor_reports_none_for_resident_analysis(any_system):
+    """Factor reports NONE when the analysis of its input token is resident."""
+    indptr, indices, values, _dense, _right_hand_side = any_system
+    indptr, indices, values = map(jnp.asarray, (indptr, indices, values))
+    # A scale no other test uses, so the factor call does not deduplicate.
+    scaled_values = values * 11.0
+    token, _ = primitive.analyze(indptr, indices, scaled_values, matrix_type=MATRIX_TYPE)
+    assert _reason_of_factor(token, indptr, indices, scaled_values) == primitive.RebuildReason.NONE
+
+
+def test_factor_reports_evicted_analysis(any_system, monkeypatch):
+    """Factor reports EVICTED when the cache dropped the analysis of its input token."""
+    indptr, indices, values, _dense, _right_hand_side = any_system
+    indptr, indices, values = map(jnp.asarray, (indptr, indices, values))
+    monkeypatch.setenv("PARDISO_MKL_JAX_FACTOR_CACHE", "1")
+    scaled_values = values * 12.0
+    token, _ = primitive.analyze(indptr, indices, scaled_values, matrix_type=MATRIX_TYPE)
+    # A second analysis evicts the first one at capacity 1.
+    primitive.analyze(indptr, indices, values * 13.0, matrix_type=MATRIX_TYPE)
+
+    primitive.reset_rebuild_count()
+    reason = _reason_of_factor(token, indptr, indices, scaled_values)
+    assert reason == primitive.RebuildReason.EVICTED
+    assert primitive.rebuild_stats()[primitive.RebuildReason.EVICTED] == 1
+
+
+def test_factor_reports_freed_analysis(any_system):
+    """Factor reports FREED when its input token was released."""
+    indptr, indices, values, _dense, _right_hand_side = any_system
+    indptr, indices, values = map(jnp.asarray, (indptr, indices, values))
+    scaled_values = values * 14.0
+    token, _ = primitive.analyze(indptr, indices, scaled_values, matrix_type=MATRIX_TYPE)
+    primitive.release(token)
+    assert _reason_of_factor(token, indptr, indices, scaled_values) == primitive.RebuildReason.FREED
+
+
+def test_factor_reports_superseded_analysis(any_system):
+    """Factor reports SUPERSEDED when an earlier factor call consumed its input token."""
+    indptr, indices, values, dense, right_hand_side = any_system
+    indptr, indices, values = map(jnp.asarray, (indptr, indices, values))
+    token, _ = primitive.analyze(indptr, indices, values * 15.0, matrix_type=MATRIX_TYPE)
+    primitive.factor(token, indptr, indices, values * 16.0, matrix_type=MATRIX_TYPE)
+
+    # The first call re-keyed the analysis, so this second use of the same token rebuilds.
+    new_values = values * 17.0
+    new_token, _, reason = primitive.factor(
+        token, indptr, indices, new_values, matrix_type=MATRIX_TYPE
+    )
+    assert primitive.RebuildReason(int(reason)) == primitive.RebuildReason.SUPERSEDED
+    solution, _, _ = primitive.solve_stateful(
+        new_token,
+        indptr,
+        indices,
+        new_values,
+        jnp.asarray(right_hand_side)[None, :],
+        matrix_type=MATRIX_TYPE,
+    )
+    np.testing.assert_allclose(
+        np.asarray(solution[0]),
+        np.linalg.solve(dense * 17.0, right_hand_side),
+        rtol=1e-8,
+        atol=1e-10,
+    )

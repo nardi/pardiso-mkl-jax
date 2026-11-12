@@ -369,16 +369,17 @@ class PardisoDiagnostics:
     """All 64 iparm entries, for anything not decoded into a named field above."""
 
     rebuild_reason: jax.Array
-    """Whether the solve reused a cached factorization or rebuilt one, as a
+    """Whether the call reused a cached factorization or rebuilt one, as a
     RebuildReason value (see pardiso_mkl_jax.primitive). NONE (0) on a cache hit,
-    and on calls where the question does not apply (analyze, factor, and the
-    functional solve, which never reuses a factorization)."""
+    and on calls where the question does not apply (analyze and the functional
+    solve, which never reuses a factorization). The reanalyze primitive can
+    rebuild an evicted handle, but it returns no reason, so it reports NONE."""
 
     @staticmethod
     def from_iparm(iparm: jax.Array, rebuild_reason: jax.Array | None = None) -> PardisoDiagnostics:
         """Decode a final iparm array (shape (..., 64)) into a PardisoDiagnostics.
 
-        rebuild_reason is the per-call RebuildReason from a stateful solve. When
+        rebuild_reason is the per-call RebuildReason from a factor or a stateful solve. When
         it is not given, it defaults to NONE (0), broadcast to iparm's batch
         shape, for calls where a cache hit or miss does not apply.
         """

@@ -23,6 +23,7 @@ void* pardiso_reanalyze_handler_address();
 // Handler for the numeric factorization step (phase 22). Takes an analyze
 // handle and returns a distinct factor-domain handle naming the factorization
 // of these values, so a downstream solve that consumes it is ordered after it.
+// A third output reports why the analysis was rebuilt, or NONE if it was not.
 void* pardiso_factor_handler_address();
 
 // Stateful handler for the solve step (phase 33), run against a
