@@ -3,8 +3,10 @@ site_name = "pardiso-mkl-jax"
 site_description = "JAX-compatible interface to the oneMKL Pardiso direct sparse solver."
 site_author = "nardi"
 site_url = "https://nardi.github.io/pardiso-mkl-jax/"
+repo_url = "https://github.com/nardi/pardiso-mkl-jax"
+repo_name = "nardi/pardiso-mkl-jax"
 copyright = """
-Copyright &copy; 2026 nardi
+Copyright &copy; 2026 Nardi Lam
 """
 
 nav = [
